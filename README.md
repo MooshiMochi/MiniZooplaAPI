@@ -40,6 +40,27 @@ address, bedrooms, bathrooms, property_type, listing_type, listing_url, image_ur
 You need **Python 3.10+**. The scraper uses a headless browser (via scrapling/patchright),
 so the first install also downloads a browser binary.
 
+### Configuration (env vars / `.env`)
+
+All settings are read from environment variables, and a `.env` file in the project
+root is loaded automatically (real shell env vars always win). Copy the template and
+edit it:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MINI_ZOOLA_HOST` | `127.0.0.1` | Bind address. Defaults to **localhost only** (safe — Cloudflare Tunnel reaches it). Set `0.0.0.0` only if you intentionally expose the port directly. |
+| `MINI_ZOOLA_PORT` | `8000` | Listen port. |
+| `MINI_ZOOLA_ADMIN_KEY` | _(empty)_ | Required to enable `/admin/*` key management. Generate with `openssl rand -hex 24`. |
+| `MINI_ZOOLA_RATE_LIMIT` | `60` | Default requests/minute per key owner. |
+| `MINI_ZOOLA_CACHE_TTL` | `300` | Response cache TTL (seconds) — avoids re-scraping the same branch. |
+| `MINI_ZOOLA_KEYS_DB` | `keys.db` | Path to the API-key store (SQLite). |
+
+> Never commit your real `.env` — it's gitignored. Only `.env.example` is tracked.
+
 ### Windows
 
 Using **PowerShell** (recommended) or the same commands in a normal terminal:
@@ -143,6 +164,12 @@ WorkingDirectory=/opt/minizoopla
 ExecStart=/opt/minizoopla/venv/bin/python main.py
 Restart=always
 RestartSec=5
+# Bind is localhost by default (127.0.0.1). Set secrets here, never in source control.
+Environment=MINI_ZOOLA_HOST=127.0.0.1
+Environment=MINI_ZOOLA_PORT=8000
+Environment=MINI_ZOOLA_ADMIN_KEY=REPLACE_WITH_openssl_rand_-hex_24
+Environment=MINI_ZOOLA_RATE_LIMIT=60
+Environment=MINI_ZOOLA_CACHE_TTL=300
 
 [Install]
 WantedBy=multi-user.target
@@ -193,6 +220,8 @@ module.exports = {
     max_memory_restart: '1G',
     env: {
       // Set secrets OUTSIDE source control, e.g. in your shell / a non-committed .env
+      MINI_ZOOLA_HOST: process.env.MINI_ZOOLA_HOST || '127.0.0.1',
+      MINI_ZOOLA_PORT: process.env.MINI_ZOOLA_PORT || '8000',
       MINI_ZOOLA_ADMIN_KEY: process.env.MINI_ZOOLA_ADMIN_KEY,
       MINI_ZOOLA_RATE_LIMIT: process.env.MINI_ZOOLA_RATE_LIMIT || '60',
       MINI_ZOOLA_CACHE_TTL: process.env.MINI_ZOOLA_CACHE_TTL || '300',

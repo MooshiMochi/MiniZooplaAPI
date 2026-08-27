@@ -20,6 +20,24 @@ from pydantic import BaseModel
 from scrapling.fetchers import StealthyFetcher
 from scrapling import Selector
 
+# Load .env file (if present) into os.environ — no external dependency needed.
+# Real environment variables always win over values in .env.
+def _load_dotenv(path: str = ".env") -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key, val = key.strip(), val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+
+_load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -35,6 +53,8 @@ KEYS_DB_PATH = os.getenv("MINI_ZOOLA_KEYS_DB", "keys.db")
 DEFAULT_RATE_LIMIT = int(os.getenv("MINI_ZOOLA_RATE_LIMIT", "60"))  # requests / owner / minute
 CACHE_TTL = int(os.getenv("MINI_ZOOLA_CACHE_TTL", "300"))            # seconds
 ADMIN_KEY = os.getenv("MINI_ZOOLA_ADMIN_KEY")                        # if set, /admin/* enabled
+HOST = os.getenv("MINI_ZOOLA_HOST", "127.0.0.1")                     # bind address (default: localhost only)
+PORT = int(os.getenv("MINI_ZOOLA_PORT", "8000"))                     # listen port
 
 # ----------------------------------------------------------------------------
 # API key store (SQLite). Keys are hashed (SHA-256); plaintext shown once.
@@ -446,4 +466,4 @@ async def revoke_key(key_id: str, _=Depends(require_admin)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=HOST, port=PORT)

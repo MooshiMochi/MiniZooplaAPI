@@ -26,6 +26,8 @@ keys.db
 *.pem
 credentials*.json
 cloudflared*.json
+# Committed example is fine; real .env is ignored
+!.env.example
 
 # Logs
 *.log
