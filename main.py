@@ -58,8 +58,9 @@ PORT = int(os.getenv("MINI_ZOOPLA_PORT", "8000"))                     # listen p
 
 # ----------------------------------------------------------------------------
 # API key store (SQLite). Keys are hashed (SHA-256); plaintext shown once.
-# App-layer "RLS": every key belongs to an `owner` and may be restricted to a
-# set of `allowed_branch_ids`. All enforcement happens per authenticated key.
+# App-layer "RLS": every key belongs to an `owner` and is not bound to any
+# particular branch_id — a valid key works against any branch. Enforcement
+# is per authenticated key (rate limit + active flag).
 # ----------------------------------------------------------------------------
 class KeyStore:
     def __init__(self, path: str):
@@ -71,7 +72,6 @@ class KeyStore:
                 key_hash TEXT UNIQUE NOT NULL,
                 owner TEXT NOT NULL,
                 name TEXT,
-                allowed_branches TEXT,          -- comma-separated branch ids or '' for any
                 rate_limit INTEGER,             -- per-minute limit or NULL for default
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
@@ -82,48 +82,51 @@ class KeyStore:
     def _hash(self, key: str) -> str:
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
-    def create_key(self, owner: str, name: str = "", allowed_branches: Optional[List[str]] = None,
-                   rate_limit: Optional[int] = None) -> str:
+    def create_key(self, owner: str, name: str = "", rate_limit: Optional[int] = None) -> str:
         raw = "mz_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
         key_id = secrets.token_hex(8)
-        branches = ",".join(allowed_branches) if allowed_branches else ""
         self.conn.execute(
-            "INSERT INTO api_keys (key_id, key_hash, owner, name, allowed_branches, rate_limit, active, created_at) "
-            "VALUES (?,?,?,?,?,?,1,?)",
-            (key_id, self._hash(raw), owner, name, branches, rate_limit, datetime.utcnow().isoformat()),
+            "INSERT INTO api_keys (key_id, key_hash, owner, name, rate_limit, active, created_at) "
+            "VALUES (?,?,?,?,?,1,?)",
+            (key_id, self._hash(raw), owner, name, rate_limit, datetime.utcnow().isoformat()),
         )
         self.conn.commit()
         return raw  # plaintext, returned to caller only at creation time
 
     def get_by_hash(self, key_hash: str):
         row = self.conn.execute(
-            "SELECT key_id, owner, name, allowed_branches, rate_limit, active FROM api_keys WHERE key_hash=?",
+            "SELECT key_id, owner, name, rate_limit, active FROM api_keys WHERE key_hash=?",
             (key_hash,),
         ).fetchone()
-        if not row or row[5] != 1:
+        if not row or row[4] != 1:
             return None
         return {
             "key_id": row[0],
             "owner": row[1],
             "name": row[2],
-            "allowed_branches": [b for b in row[3].split(",") if b] if row[3] else [],
-            "rate_limit": row[4],
+            "rate_limit": row[3],
         }
 
     def revoke(self, key_id: str) -> bool:
+        """Soft delete: mark the key inactive. It stays in the DB."""
         cur = self.conn.execute("UPDATE api_keys SET active=0 WHERE key_id=?", (key_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def delete_key(self, key_id: str) -> bool:
+        """Hard delete: purge the key row from the database entirely."""
+        cur = self.conn.execute("DELETE FROM api_keys WHERE key_id=?", (key_id,))
         self.conn.commit()
         return cur.rowcount > 0
 
     def list_keys(self):
         rows = self.conn.execute(
-            "SELECT key_id, owner, name, allowed_branches, rate_limit, active, created_at FROM api_keys ORDER BY created_at DESC"
+            "SELECT key_id, owner, name, rate_limit, active, created_at FROM api_keys ORDER BY created_at DESC"
         ).fetchall()
         return [
             {
                 "key_id": r[0], "owner": r[1], "name": r[2],
-                "allowed_branches": [b for b in r[3].split(",") if b] if r[3] else [],
-                "rate_limit": r[4], "active": bool(r[5]), "created_at": r[6],
+                "rate_limit": r[3], "active": bool(r[4]), "created_at": r[5],
             }
             for r in rows
         ]
@@ -195,10 +198,6 @@ def authenticate(
     return record
 
 
-def enforce_branch_access(record: dict, branch_id: str):
-    allowed = record["allowed_branches"]
-    if allowed and branch_id not in allowed:
-        raise HTTPException(status_code=403, detail="API key not permitted for this branch_id")
 
 
 # ----------------------------------------------------------------------------
@@ -255,13 +254,13 @@ def _extract_listing_id(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def scrape_zoopla_agency(agency_slug: str, max_pages: int = 3, listing_type: str = "rent") -> List[Property]:
+def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str = "rent") -> List[Property]:
     properties: List[Property] = []
     listing_type = listing_type.lower()
     if listing_type not in ("rent", "sale"):
         listing_type = "rent"
     section = "for-sale" if listing_type == "sale" else "to-rent"
-    base_url = f"https://www.zoopla.co.uk/{section}/property/uk/?branch_id={agency_slug}"
+    base_url = f"https://www.zoopla.co.uk/{section}/property/uk/?branch_id={branch_id}"
 
     fetcher = StealthyFetcher()
     for page in range(1, max_pages + 1):
@@ -411,33 +410,31 @@ async def health_check():
     return {"status": "healthy"}
 
 
-@app.get("/api/agency/{agency_slug}")
+@app.get("/api/agency/{branch_id}")
 async def get_agency_listings(
-    agency_slug: str,
+    branch_id: str,
     max_pages: int = Query(3, ge=1, le=10, description="Maximum pages to scrape"),
     listing_type: str = Query("rent", description="rent or sale"),
     fmt: str = Query("json", description="json or csv"),
     record: dict = Depends(authenticate),
 ):
-    # 1. Branch allow-list (app-layer RLS)
-    enforce_branch_access(record, agency_slug)
-    # 2. Rate limit (per owner)
+    # 1. Rate limit (per owner)
     limit = record["rate_limit"] or DEFAULT_RATE_LIMIT
     if not limiter.allow(record["owner"], limit):
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({limit}/min for owner '{record['owner']}')")
 
-    cache_key = (agency_slug, listing_type, max_pages)
+    cache_key = (branch_id, listing_type, max_pages)
     cached = cache.get(cache_key)
     if cached is not None:
         if fmt == "csv":
             return PlainTextResponse(properties_to_csv(cached), media_type="text/csv",
-                                     headers={"Content-Disposition": f'attachment; filename="agency_{agency_slug}_{listing_type}.csv"'})
-        return AgencyListingsResponse(agency=agency_slug, listing_type=listing_type, properties=cached, total=len(cached), cached=True)
+                                     headers={"Content-Disposition": f'attachment; filename="agency_{branch_id}_{listing_type}.csv"'})
+        return AgencyListingsResponse(agency=branch_id, listing_type=listing_type, properties=cached, total=len(cached), cached=True)
 
     loop = asyncio.get_event_loop()
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor() as pool:
-        properties = await loop.run_in_executor(pool, scrape_zoopla_agency, agency_slug, max_pages, listing_type)
+        properties = await loop.run_in_executor(pool, scrape_zoopla_agency, branch_id, max_pages, listing_type)
 
     # Never cache empty results: they are usually a transient bot-challenge/empty
     # page, and caching them would poison the cache for the whole TTL window.
@@ -445,8 +442,8 @@ async def get_agency_listings(
         cache.set(cache_key, properties)
     if fmt == "csv":
         return PlainTextResponse(properties_to_csv(properties), media_type="text/csv",
-                                 headers={"Content-Disposition": f'attachment; filename="agency_{agency_slug}_{listing_type}.csv"'})
-    return AgencyListingsResponse(agency=agency_slug, listing_type=listing_type, properties=properties, total=len(properties), cached=False)
+                                 headers={"Content-Disposition": f'attachment; filename="agency_{branch_id}_{listing_type}.csv"'})
+    return AgencyListingsResponse(agency=branch_id, listing_type=listing_type, properties=properties, total=len(properties), cached=False)
 
 
 # ----------------------------------------------------------------------------
@@ -462,13 +459,12 @@ def require_admin(x_admin_key: Optional[str] = Header(default=None)):
 class KeyCreate(BaseModel):
     owner: str
     name: str = ""
-    allowed_branches: Optional[List[str]] = None
     rate_limit: Optional[int] = None
 
 
 @app.post("/admin/keys")
 async def create_key(body: KeyCreate, _=Depends(require_admin)):
-    raw = store.create_key(body.owner, body.name, body.allowed_branches, body.rate_limit)
+    raw = store.create_key(body.owner, body.name, body.rate_limit)
     return {"key": raw, "owner": body.owner, "note": "Store this key securely; it is shown only once."}
 
 
@@ -478,10 +474,15 @@ async def list_keys(_=Depends(require_admin)):
 
 
 @app.delete("/admin/keys/{key_id}")
-async def revoke_key(key_id: str, _=Depends(require_admin)):
-    if not store.revoke(key_id):
+async def revoke_or_delete_key(
+    key_id: str,
+    purge: bool = Query(False, description="If true, delete the key row from the database entirely instead of just deactivating it"),
+    _=Depends(require_admin),
+):
+    ok = store.delete_key(key_id) if purge else store.revoke(key_id)
+    if not ok:
         raise HTTPException(status_code=404, detail="Key not found")
-    return {"revoked": key_id}
+    return {"deleted": key_id, "purged": bool(purge)}
 
 
 if __name__ == "__main__":

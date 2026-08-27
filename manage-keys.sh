@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# manage-keys.sh — create / list / revoke Mini Zoopla API keys via the live API.
+# manage-keys.sh — create / list / revoke / delete Mini Zoopla API keys via the live API.
 # Works on Linux, macOS, and Windows (Git Bash / WSL).
 #
 # Reads config from .env in the script's directory (or current dir):
@@ -8,17 +8,38 @@
 #   MINI_ZOOPLA_HOST        (default 127.0.0.1)
 #   MINI_ZOOPLA_PORT        (default 8000)
 #
-# Usage:
-#   ./manage-keys.sh list
-#   ./manage-keys.sh create <owner> [allowed_branches_csv] [rate_limit]
-#   ./manage-keys.sh revoke <key_id>
-#   ./manage-keys.sh show   <key_id>
+# Commands:
+#   list                                   List all keys (active + revoked)
+#   create <owner> [rate_limit]            Create a key (NOT bound to any branch)
+#   revoke <key_id>                        Soft delete: deactivate the key (kept in DB)
+#   delete <key_id>                        Hard delete: purge the key from the database
+#   show <key_id>                          Show one key's details
+#   help [command]                         Show usage (optionally for one command)
+#
+# Any command accepts -h / --help for its own usage.
 #
 # Examples:
-#   ./manage-keys.sh create sheets_user 56042,12345 60
+#   ./manage-keys.sh create sheets_user 60
 #   ./manage-keys.sh revoke a1b2c3d4e5f6
+#   ./manage-keys.sh delete a1b2c3d4e5f6
 #
 set -euo pipefail
+
+usage_all() {
+  grep '^#' "$0" | sed 's/^# \{0,1\}//'
+}
+
+usage_cmd() {
+  case "$1" in
+    list)    echo "Usage: $0 list";;
+    create)  echo "Usage: $0 create <owner> [rate_limit]";;
+    revoke)  echo "Usage: $0 revoke <key_id>   (soft delete — key stays in DB, deactivated)";;
+    delete)  echo "Usage: $0 delete <key_id>   (hard delete — purged from DB)";;
+    show)    echo "Usage: $0 show <key_id>";;
+    help)    echo "Usage: $0 help [command]";;
+    *)       echo "Unknown command: $1"; usage_all; exit 1;;
+  esac
+}
 
 # Locate .env next to this script, then cwd.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,8 +77,13 @@ if [ -z "$ADMIN_KEY" ]; then
   exit 1
 fi
 
-cmd="${1:-}"
+cmd="${1:-help}"
 shift || true
+
+# Per-command --help flag
+case "${1:-}" in
+  -h|--help) usage_cmd "$cmd"; exit 0;;
+esac
 
 case "$cmd" in
   list)
@@ -65,14 +91,9 @@ case "$cmd" in
       | python3 -m json.tool 2>/dev/null || curl -fsS -H "X-Admin-Key: ${ADMIN_KEY}" "${BASE}/admin/keys"
     ;;
   create)
-    [ $# -ge 1 ] || { echo "Usage: $0 create <owner> [allowed_branches_csv] [rate_limit]" >&2; exit 1; }
-    owner="$1"; branches="${2:-}"; limit="${3:-}"
+    [ $# -ge 1 ] || { usage_cmd create >&2; exit 1; }
+    owner="$1"; limit="${2:-}"
     payload=$(printf '{"owner":%s' "$(python3 -c "import json,sys;print(json.dumps(sys.argv[1]))" "$owner")")
-    if [ -n "$branches" ]; then
-      IFS=',' read -ra arr <<< "$branches"
-      bjson=$(printf '%s\n' "${arr[@]}" | python3 -c "import json,sys;print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))")
-      payload="${payload},\"allowed_branches\":${bjson}"
-    fi
     [ -n "$limit" ] && payload="${payload},\"rate_limit\":${limit}"
     payload="${payload}}"
     echo "Creating key: ${payload}"
@@ -83,22 +104,31 @@ case "$cmd" in
     echo "NOTE: the 'key' value above is shown only once. Store it securely." >&2
     ;;
   revoke)
-    [ $# -ge 1 ] || { echo "Usage: $0 revoke <key_id>" >&2; exit 1; }
+    [ $# -ge 1 ] || { usage_cmd revoke >&2; exit 1; }
     curl -fsS -X DELETE -H "X-Admin-Key: ${ADMIN_KEY}" "${BASE}/admin/keys/$1"
     echo ""
     ;;
+  delete)
+    [ $# -ge 1 ] || { usage_cmd delete >&2; exit 1; }
+    curl -fsS -X DELETE -H "X-Admin-Key: ${ADMIN_KEY}" "${BASE}/admin/keys/$1?purge=true"
+    echo ""
+    ;;
   show)
-    [ $# -ge 1 ] || { echo "Usage: $0 show <key_id>" >&2; exit 1; }
+    [ $# -ge 1 ] || { usage_cmd show >&2; exit 1; }
     curl -fsS -H "X-Admin-Key: ${ADMIN_KEY}" "${BASE}/admin/keys" \
       | python3 -c "import json,sys; d=json.load(sys.stdin); k=[x for x in d['keys'] if x['key_id']==sys.argv[1]]; print(json.dumps(k[0] if k else {'error':'not found'}, indent=2))" "$1"
     ;;
   ""|-h|--help|help)
-    grep '^#' "$0" | sed 's/^# \{0,1\}//' >&2
+    if [ -n "${1:-}" ] && [ "$1" != "-h" ] && [ "$1" != "--help" ]; then
+      usage_cmd "$1"
+    else
+      usage_all
+    fi
     exit 0
     ;;
   *)
     echo "Unknown command: $cmd" >&2
-    echo "Run '$0 help' for usage." >&2
+    usage_all >&2
     exit 1
     ;;
 esac

@@ -336,21 +336,17 @@ Every `/api/agency/{branch_id}` call requires an API key in the `X-API-Key` head
 Keys are stored in a local SQLite file (`keys.db`, gitignored — never committed). The
 key itself is **hashed** (SHA-256); the plaintext is shown only once at creation.
 
-### How "RLS" works here (app-layer, not Postgres)
+### How keys are scoped (app-layer, not Postgres)
 
-This project deliberately avoids Postgres/Redis to stay lightweight. Instead, every
-key is scoped at the **application layer**:
+This project deliberately avoids Postgres/Redis to stay lightweight. Every key is scoped at
+the **application layer**:
 
 - `owner` — who the key belongs to (used for rate-limit accounting + auditing).
-- `allowed_branches` — optional comma-separated list of branch ids the key may query.
-  A key with `allowed_branches=["12345"]` gets `403` on any other branch. Empty/`""`
-  means "any branch".
 - `rate_limit` — per-owner requests/minute. Defaults to `MINI_ZOOPLA_RATE_LIMIT` (60).
-- `active` — soft-delete via revoke (no row deletion, so audit history survives).
+- `active` — soft-delete via revoke (key stays in DB, just deactivated). `delete` purges it.
 
-This gives you per-client isolation (the "R" in RLS) without a separate database
-service. If you later need true PostgreSQL Row-Level Security, swap `KeyStore` for a
-Postgres backend — the `authenticate`/`enforce_branch_access` logic stays the same.
+**Keys are not bound to any branch.** A valid key works against any `branch_id` — the
+`branch_id` in the URL is just the agency you're querying, not a permission scope.
 
 ### Configure the server
 
@@ -367,19 +363,23 @@ export MINI_ZOOPLA_KEYS_DB="keys.db"   # path to the key store
 ### Create and manage keys (admin)
 
 ```bash
-# Create a key scoped to one branch for a Google Sheets user
+# Create a key for a Google Sheets user (NOT bound to any branch)
 curl -X POST https://your-tunnel.yourdomain.com/admin/keys \
   -H "X-Admin-Key: $MINI_ZOOPLA_ADMIN_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"owner":"sheets_user","name":"google_sheets","allowed_branches":["12345"],"rate_limit":60}'
+  -d '{"owner":"sheets_user","name":"google_sheets","rate_limit":60}'
 
 # -> {"key":"mz_xxxx...","owner":"sheets_user","note":"Store this key securely; it is shown only once."}
 
 # List keys (hashes never returned)
 curl https://your-tunnel.yourdomain.com/admin/keys -H "X-Admin-Key: $MINI_ZOOPLA_ADMIN_KEY"
 
-# Revoke a key (soft delete)
+# Revoke a key (soft delete — stays in DB, but can no longer authenticate)
 curl -X DELETE https://your-tunnel.yourdomain.com/admin/keys/<key_id> \
+  -H "X-Admin-Key: $MINI_ZOOPLA_ADMIN_KEY"
+
+# Delete a key (hard delete — purged from the database entirely)
+curl -X DELETE "https://your-tunnel.yourdomain.com/admin/keys/<key_id>?purge=true" \
   -H "X-Admin-Key: $MINI_ZOOPLA_ADMIN_KEY"
 ```
 
@@ -387,27 +387,29 @@ curl -X DELETE https://your-tunnel.yourdomain.com/admin/keys/<key_id> \
 
 Manually curling every key op gets tedious. Use the bundled cross-platform scripts instead —
 they read `MINI_ZOOPLA_ADMIN_KEY` / `HOST` / `PORT` from your `.env` and error out if the
-admin key is missing:
+admin key is missing. Every command accepts `-h` / `--help` for its own usage:
 
 ```bash
 # Linux / macOS / Git Bash / WSL
 ./manage-keys.sh list
-./manage-keys.sh create sheets_user 56042,12345 60
-./manage-keys.sh revoke <key_id>
+./manage-keys.sh create sheets_user 60
+./manage-keys.sh revoke <key_id>     # soft delete (kept in DB, deactivated)
+./manage-keys.sh delete <key_id>     # hard delete (purged from DB)
 ./manage-keys.sh show   <key_id>
 ```
 
 ```powershell
 # Windows PowerShell
 .\manage-keys.ps1 list
-.\manage-keys.ps1 create sheets_user 56042,12345 60
-.\manage-keys.ps1 revoke <key_id>
+.\manage-keys.ps1 create sheets_user 60
+.\manage-keys.ps1 revoke <key_id>     # soft delete
+.\manage-keys.ps1 delete <key_id>     # hard delete
 .\manage-keys.ps1 show   <key_id>
 ```
 
-`create` takes `<owner> [allowed_branches_csv] [rate_limit]` — branches and rate limit are
-optional (default: all branches, `MINI_ZOOPLA_RATE_LIMIT`). The plaintext key is shown only
-once on create, so copy it immediately. List/show never return key hashes.
+`create` takes `<owner> [rate_limit]` — only the owner is required; rate limit is optional
+(default: `MINI_ZOOPLA_RATE_LIMIT`). The plaintext key is shown only once on create, so copy
+it immediately. List/show never return key hashes.
 
 ### Call the API with a key
 
