@@ -383,6 +383,32 @@ curl -X DELETE https://your-tunnel.yourdomain.com/admin/keys/<key_id> \
   -H "X-Admin-Key: $MINI_ZOOPLA_ADMIN_KEY"
 ```
 
+### Key management script (recommended)
+
+Manually curling every key op gets tedious. Use the bundled cross-platform scripts instead —
+they read `MINI_ZOOPLA_ADMIN_KEY` / `HOST` / `PORT` from your `.env` and error out if the
+admin key is missing:
+
+```bash
+# Linux / macOS / Git Bash / WSL
+./manage-keys.sh list
+./manage-keys.sh create sheets_user 56042,12345 60
+./manage-keys.sh revoke <key_id>
+./manage-keys.sh show   <key_id>
+```
+
+```powershell
+# Windows PowerShell
+.\manage-keys.ps1 list
+.\manage-keys.ps1 create sheets_user 56042,12345 60
+.\manage-keys.ps1 revoke <key_id>
+.\manage-keys.ps1 show   <key_id>
+```
+
+`create` takes `<owner> [allowed_branches_csv] [rate_limit]` — branches and rate limit are
+optional (default: all branches, `MINI_ZOOPLA_RATE_LIMIT`). The plaintext key is shown only
+once on create, so copy it immediately. List/show never return key hashes.
+
 ### Call the API with a key
 
 ```bash
