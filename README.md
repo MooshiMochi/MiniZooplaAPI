@@ -158,6 +158,68 @@ curl http://localhost:8000/health
 The app binds `0.0.0.0:8000` but is localhost-only — Cloudflare Tunnel is what makes
 it public. No firewall ports need to be opened.
 
+### Run it with PM2 (alternative to systemd)
+
+PM2 is handy if you already use it for other Node services on the VPS, or prefer not
+to write a systemd unit. Works on Linux/macOS/Windows (WSL).
+
+```bash
+# Install PM2 (once, globally)
+sudo npm install -g pm2          # or: npm install -g pm2  (no sudo if using nvm)
+
+# From the project dir, start the API under PM2
+pm2 start "venv/bin/python main.py" --name mini-zoopla \
+  --interpreter none \
+  -- \
+  && pm2 save                      # persist so it comes back after reboot
+sudo pm2 startup                   # (Linux) enable the PM2 respawn service on boot
+```
+
+Pass environment variables (admin key, limits) via an ecosystem file instead of the
+shell so they aren't visible in `ps`. Save as `ecosystem.config.cjs`:
+
+```javascript
+module.exports = {
+  apps: [{
+    name: 'mini-zoopla',
+    cwd: '/opt/minizoopla',
+    script: '/opt/minizoopla/venv/bin/python',
+    args: 'main.py',
+    interpreter: 'none',
+    instances: 1,
+    exec_mode: 'fork',
+    autorestart: true,
+    watch: false,
+    max_memory_restart: '1G',
+    env: {
+      // Set secrets OUTSIDE source control, e.g. in your shell / a non-committed .env
+      MINI_ZOOLA_ADMIN_KEY: process.env.MINI_ZOOLA_ADMIN_KEY,
+      MINI_ZOOLA_RATE_LIMIT: process.env.MINI_ZOOLA_RATE_LIMIT || '60',
+      MINI_ZOOLA_CACHE_TTL: process.env.MINI_ZOOLA_CACHE_TTL || '300',
+    },
+  }],
+};
+```
+
+```bash
+# Load env first (never commit the file), then start:
+export MINI_ZOOLA_ADMIN_KEY="$(openssl rand -hex 24)"
+pm2 start ecosystem.config.cjs
+pm2 save
+```
+
+Useful PM2 commands:
+```bash
+pm2 ls                      # list processes
+pm2 logs mini-zoopla        # tail logs
+pm2 restart mini-zoopla
+pm2 delete mini-zoopla
+```
+
+> Note: the API runs a headless browser per scrape, so keep `instances: 1` (fork mode).
+> Horizontal scaling would need a shared cache/key store; for a personal API this is
+> plenty.
+
 ---
 
 ## Exposing it via Cloudflare Tunnel (cloudflared)
@@ -231,6 +293,81 @@ You can now call:
 ```
 https://your-tunnel.yourdomain.com/api/agency/12345?listing_type=sale&fmt=csv
 ```
+
+---
+
+## Authentication, API keys & rate limiting
+
+Every `/api/agency/{branch_id}` call requires an API key in the `X-API-Key` header.
+Keys are stored in a local SQLite file (`keys.db`, gitignored — never committed). The
+key itself is **hashed** (SHA-256); the plaintext is shown only once at creation.
+
+### How "RLS" works here (app-layer, not Postgres)
+
+This project deliberately avoids Postgres/Redis to stay lightweight. Instead, every
+key is scoped at the **application layer**:
+
+- `owner` — who the key belongs to (used for rate-limit accounting + auditing).
+- `allowed_branches` — optional comma-separated list of branch ids the key may query.
+  A key with `allowed_branches=["12345"]` gets `403` on any other branch. Empty/`""`
+  means "any branch".
+- `rate_limit` — per-owner requests/minute. Defaults to `MINI_ZOOLA_RATE_LIMIT` (60).
+- `active` — soft-delete via revoke (no row deletion, so audit history survives).
+
+This gives you per-client isolation (the "R" in RLS) without a separate database
+service. If you later need true PostgreSQL Row-Level Security, swap `KeyStore` for a
+Postgres backend — the `authenticate`/`enforce_branch_access` logic stays the same.
+
+### Configure the server
+
+```bash
+# Required to enable key management endpoints (/admin/*):
+export MINI_ZOOLA_ADMIN_KEY="$(openssl rand -hex 24)"   # the one key that can mint others
+
+# Optional tuning (with sane defaults):
+export MINI_ZOOLA_RATE_LIMIT="60"     # default req/min per owner
+export MINI_ZOOLA_CACHE_TTL="300"     # seconds; cached responses skip re-scraping
+export MINI_ZOOLA_KEYS_DB="keys.db"   # path to the key store
+```
+
+### Create and manage keys (admin)
+
+```bash
+# Create a key scoped to one branch for a Google Sheets user
+curl -X POST https://your-tunnel.yourdomain.com/admin/keys \
+  -H "X-Admin-Key: $MINI_ZOOLA_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"owner":"sheets_user","name":"google_sheets","allowed_branches":["12345"],"rate_limit":60}'
+
+# -> {"key":"mz_xxxx...","owner":"sheets_user","note":"Store this key securely; it is shown only once."}
+
+# List keys (hashes never returned)
+curl https://your-tunnel.yourdomain.com/admin/keys -H "X-Admin-Key: $MINI_ZOOLA_ADMIN_KEY"
+
+# Revoke a key (soft delete)
+curl -X DELETE https://your-tunnel.yourdomain.com/admin/keys/<key_id> \
+  -H "X-Admin-Key: $MINI_ZOOLA_ADMIN_KEY"
+```
+
+### Call the API with a key
+
+```bash
+curl https://your-tunnel.yourdomain.com/api/agency/12345?fmt=csv \
+  -H "X-API-Key: mz_xxxx..."
+```
+
+In Google Sheets:
+```
+=IMPORTDATA("https://your-tunnel.yourdomain.com/api/agency/12345?fmt=csv")
+```
+and add the header via Apps Script, or pass the key as a query param if you prefer:
+the endpoint also accepts `?api_key=mz_xxxx...` as a fallback to the header.
+
+> Security notes:
+> - Never commit `keys.db` or `MINI_ZOOLA_ADMIN_KEY`. Both are in `.gitignore`.
+> - Rotate the admin key by changing the env var and revoking old client keys.
+> - Rate limiting is an in-memory fixed window (per owner); it resets on restart and is
+>   not shared across multiple API processes. Fine for a single-instance personal API.
 
 ---
 

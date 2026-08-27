@@ -13,8 +13,11 @@ venv/
 # Scrapling adaptive-selector fingerprint database (runtime artifact)
 *.sqlite
 *.sqlite3
-*.db
 .scrapling/
+
+# API key store (contains hashed keys — never commit)
+keys.db
+*.db
 
 # Secrets / env
 .env
