@@ -10,3 +10,5 @@ browserforge==1.2.4
 patchright==1.62.1
 playwright==1.62.0
 pydantic==2.13.4
+# scrapling runtime dependency (not always declared transitively on fresh installs)
+msgspec==0.21.1
