@@ -130,9 +130,14 @@ python3 -m venv venv
 # 4. Install Python deps
 venv/bin/pip install -r requirements.txt
 
-# 5. Download the stealth browser
+# 5. Download the stealth browser AND its OS libraries
 venv/bin/python -m patchright install chromium
 #    (or: venv/bin/python -m playwright install chromium)
+#    On Linux the browser binary alone is not enough — it needs system shared
+#    libraries (libnss3, libnspr4, libgbm1, libgtk-3-0, ...). Install them as root:
+sudo venv/bin/python -m playwright install-deps chromium
+#    If that fails, fall back to apt directly (Debian/Ubuntu):
+#    sudo apt-get install -y libnss3 libnspr4 libgbm1 libgtk-3-0 libasound2 libatspi2.0-0
 
 # 6. Run (foreground, for testing)
 venv/bin/python main.py
@@ -430,3 +435,29 @@ then parse with the `IMPORTJSON` Apps Script, or `FILTERXML` on the XML-ized bod
   machine** you deploy to — the headless browser is not part of the pip package.
 - The service user (`www-data`) needs read+write access to the project dir for the
   adaptive-selector SQLite DB. If you hit permission errors, `chown -R www-data:www-data /opt/minizoopla`.
+
+---
+
+## Troubleshooting
+
+**`error while loading shared libraries: libnspr4.so: cannot open shared object file`**
+The browser binary is installed but the OS libraries it links against are missing.
+Install them (as root):
+```bash
+sudo /opt/minizoopla/venv/bin/python -m playwright install-deps chromium
+# or manually:
+sudo apt-get install -y libnss3 libnspr4 libgbm1 libgtk-3-0 libasound2 libatspi2.0-0
+```
+Symptom in logs: a `200` response with `0 properties` and `cached=False`, plus a
+`BrowserType.launch_persistent_context: ... browser has been closed` error.
+
+**Endpoint returns `properties: []` with no scrape logs**
+Likely a cached empty result was served (now fixed: empty results are never cached).
+If logs show `BOT-CHALLENGE` / `SUSPICIOUSLY SHORT body`, Zoopla is serving a block
+page to your server's IP — route the scraper through a residential proxy, or run it
+from a different egress IP. The Cloudflare Tunnel only affects inbound traffic, not
+the outbound request to Zoopla.
+
+**`ModuleNotFoundError: No module named msgspec`**
+`msgspec` is an undeclared runtime dependency of scrapling. It's pinned in
+`requirements.txt` — re-run `pip install -r requirements.txt`.
