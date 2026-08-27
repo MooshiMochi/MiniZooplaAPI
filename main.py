@@ -281,6 +281,23 @@ def scrape_zoopla_agency(agency_slug: str, max_pages: int = 3, listing_type: str
             if not html_content:
                 logger.warning("Empty response body on page %s", page)
                 break
+
+            # Detect bot/Cloudflare challenge so it logs loudly instead of silent []
+            low = html_content.lower()
+            challenge_hits = [kw for kw in (
+                "are you a robot", "verify you are human", "checking your browser",
+                "just a moment", "unusual traffic", "access denied", "captcha",
+                "cf-chl", "please enable javascript",
+            ) if kw in low]
+            if challenge_hits:
+                logger.warning("BOT-CHALLENGE detected on page %s: %s", page, challenge_hits)
+                break
+
+            # A real listing page is large; a tiny body means we got a stub/challenge.
+            if len(html_content) < 5000:
+                logger.warning("SUSPICIOUSLY SHORT body on page %s (%s bytes) - likely blocked; not caching", page, len(html_content))
+                break
+
             page_selector = Selector(html_content, adaptive=True, url="zoopla.co.uk")
             rows = page_selector.css(ADAPTIVE_CONFIG["listing_row"]["selector"], auto_save=True, identifier=ADAPTIVE_CONFIG["listing_row"]["identifier"])
             if not rows:
@@ -422,7 +439,10 @@ async def get_agency_listings(
     with concurrent.futures.ThreadPoolExecutor() as pool:
         properties = await loop.run_in_executor(pool, scrape_zoopla_agency, agency_slug, max_pages, listing_type)
 
-    cache.set(cache_key, properties)
+    # Never cache empty results: they are usually a transient bot-challenge/empty
+    # page, and caching them would poison the cache for the whole TTL window.
+    if properties:
+        cache.set(cache_key, properties)
     if fmt == "csv":
         return PlainTextResponse(properties_to_csv(properties), media_type="text/csv",
                                  headers={"Content-Disposition": f'attachment; filename="agency_{agency_slug}_{listing_type}.csv"'})
