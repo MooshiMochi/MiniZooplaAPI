@@ -260,16 +260,24 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
     if listing_type not in ("rent", "sale"):
         listing_type = "rent"
     section = "for-sale" if listing_type == "sale" else "to-rent"
-    base_url = f"https://www.zoopla.co.uk/{section}/property/uk/?branch_id={branch_id}"
+    base_url = f"https://www.zoopla.co.uk/{section}/property/uk/?branch_id={branch_id}&include_sold=true&include_rented=true"
 
     fetcher = StealthyFetcher()
-    for page in range(1, max_pages + 1):
+    page = 1
+    seen_listing_ids: set = set()  # dedupe across pages in case of overlap
+
+    while page <= max_pages:
         url = f"{base_url}&pn={page}" if page > 1 else base_url
         logger.info("Scraping page %s: %s", page, url)
         try:
             response = fetcher.fetch(
-                url, wait_selector='[data-testid="listing-card-content"]',
-                wait_selector_state="attached", timeout=60000, headless=True, network_idle=True,
+                url,
+                wait_selector='[data-testid="listing-card-content"]',
+                wait_selector_state="attached",
+                timeout=60000,
+                headless=True,
+                network_idle=True,
+                solve_cloudflare=True,
             )
             if response.status >= 400:
                 logger.warning("Fetch failed page %s: %s", page, response.status)
@@ -304,20 +312,84 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
             logger.info("Page %s: found %s listing rows", page, len(rows))
             if not rows:
                 break
+
             page_count = 0
             for row in rows:
                 prop = parse_listing(row, listing_type)
-                if prop:
+                if prop and prop.listing_id and prop.listing_id not in seen_listing_ids:
                     properties.append(prop)
+                    seen_listing_ids.add(prop.listing_id)
                     page_count += 1
-            logger.info("Page %s: extracted %s properties", page, page_count)
+                elif prop:
+                    # Include it but log the dedup
+                    logger.debug("Page %s: duplicate listing_id %s, skipping", page, prop.listing_id)
+                    page_count += 1
+            logger.info("Page %s: extracted %s properties (new)", page, page_count)
             if page_count == 0:
                 break
+
+            # --- Check whether a next page actually exists before fetching it ---
+            has_next = _has_next_page(page_selector, page)
+            if not has_next:
+                logger.info("Page %s: no next-page link found — reached end of results", page)
+                break
+
+            page += 1
             time.sleep(1)
         except Exception as e:
             logger.error("Error on page %s: %s", page, e)
             break
     return properties
+
+
+def _has_next_page(selector: Selector, current_page: int) -> bool:
+    """Return True if Zoopla's pagination shows a next-page link/button.
+
+    Zoopla renders a pager with page-number links and a 'Next' control.
+    We check for a next-page indicator using several common selector shapes:
+    - an anchor whose text/content signals 'Next'
+    - a page-number link for page (current_page + 1)
+    - a rel='next' link
+    """
+    # 1. Look for a "next" link by rel attribute or common text.
+    #    CSS :contains() and :has() aren't valid CSS — scrapling rejects them —
+    #    so we match by attributes and then filter by text content.
+    next_link = selector.css('a[rel="next"], a[href*="pn="][class*="next"], a[class*="next-page"]', auto_save=False)
+    if not next_link:
+        next_link = selector.css('a[rel="next"], a[href*="pn="]', auto_save=False)
+
+    if next_link:
+        for link in next_link:
+            href = link.attrib.get("href", "")
+            # If the href carries a pn= param, it must point to the expected next page.
+            if "pn=" in href:
+                if f"pn={current_page + 1}" in href:
+                    return True
+                # pn= present but wrong page — not a valid next link
+                continue
+            # No pn= in href: trust text/rel-based cues
+            txt = (link.text or "").strip().lower()
+            if txt in ("next", "next page", "›", ">") or "next" in txt:
+                return True
+            rel = link.attrib.get("rel", "").lower()
+            if rel == "next":
+                return True
+
+    # 2. Look for a page-number link for current_page + 1
+    next_page_links = selector.css(f'a[href*="pn={current_page + 1}"], a[data-page="{current_page + 1}"]', auto_save=False)
+    if next_page_links:
+        return True
+
+    # 3. Fallback: check if the pager container has a "next" class element
+    pager_next = selector.css(
+        '[class*="pager"] [class*="next"], [class*="pagination"] [class*="next"], '
+        '[class*="paging"] [class*="next"]',
+        auto_save=False,
+    )
+    if pager_next:
+        return True
+
+    return False
 
 
 def _first(node: Selector, selector: str, identifier: str, auto_save: bool):
