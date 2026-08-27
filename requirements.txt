@@ -1,0 +1,12 @@
+# Pinned dependencies for Mini Zoopla API
+# Generated from the working venv. scrapling pulls in patchright/playwright/browserforge.
+scrapling==0.4.15
+fastapi==0.141.1
+uvicorn==0.52.4
+beautifulsoup4==4.15.0
+lxml==6.1.2
+curl_cffi==0.16.1
+browserforge==1.2.4
+patchright==1.62.1
+playwright==1.62.0
+pydantic==2.13.4

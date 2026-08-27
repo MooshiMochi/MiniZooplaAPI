@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Virtual envs / local installs
+.venv/
+venv/
+
+# Scrapling adaptive-selector fingerprint database (runtime artifact)
+*.sqlite
+*.sqlite3
+*.db
+.scrapling/
+
+# Secrets / env
+.env
+.env.*
+*.key
+*.pem
+credentials*.json
+cloudflared*.json
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Anything browser-related (never commit)
+ms-playwright/
+patchright/
+chromium*/
+~/.cache/ms-playwright/
+~/.cache/patchright/
+
+# Local test artifacts
+zoopla_sample.html
+test_*.py
