@@ -49,12 +49,12 @@ StealthyFetcher.adaptive = True
 # ----------------------------------------------------------------------------
 # Config (all via env so nothing secret lands in source control)
 # ----------------------------------------------------------------------------
-KEYS_DB_PATH = os.getenv("MINI_ZOOLA_KEYS_DB", "keys.db")
-DEFAULT_RATE_LIMIT = int(os.getenv("MINI_ZOOLA_RATE_LIMIT", "60"))  # requests / owner / minute
-CACHE_TTL = int(os.getenv("MINI_ZOOLA_CACHE_TTL", "300"))            # seconds
-ADMIN_KEY = os.getenv("MINI_ZOOLA_ADMIN_KEY")                        # if set, /admin/* enabled
-HOST = os.getenv("MINI_ZOOLA_HOST", "127.0.0.1")                     # bind address (default: localhost only)
-PORT = int(os.getenv("MINI_ZOOLA_PORT", "8000"))                     # listen port
+KEYS_DB_PATH = os.getenv("MINI_ZOOPLA_KEYS_DB", "keys.db")
+DEFAULT_RATE_LIMIT = int(os.getenv("MINI_ZOOPLA_RATE_LIMIT", "60"))  # requests / owner / minute
+CACHE_TTL = int(os.getenv("MINI_ZOOPLA_CACHE_TTL", "300"))            # seconds
+ADMIN_KEY = os.getenv("MINI_ZOOPLA_ADMIN_KEY")                        # if set, /admin/* enabled
+HOST = os.getenv("MINI_ZOOPLA_HOST", "127.0.0.1")                     # bind address (default: localhost only)
+PORT = int(os.getenv("MINI_ZOOPLA_PORT", "8000"))                     # listen port
 
 # ----------------------------------------------------------------------------
 # API key store (SQLite). Keys are hashed (SHA-256); plaintext shown once.
@@ -430,11 +430,11 @@ async def get_agency_listings(
 
 
 # ----------------------------------------------------------------------------
-# Admin (key management). Enabled only if MINI_ZOOLA_ADMIN_KEY is set.
+# Admin (key management). Enabled only if MINI_ZOOPLA_ADMIN_KEY is set.
 # ----------------------------------------------------------------------------
 def require_admin(x_admin_key: Optional[str] = Header(default=None)):
     if not ADMIN_KEY:
-        raise HTTPException(status_code=503, detail="Admin disabled (set MINI_ZOOLA_ADMIN_KEY)")
+        raise HTTPException(status_code=503, detail="Admin disabled (set MINI_ZOOPLA_ADMIN_KEY)")
     if x_admin_key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Invalid admin key")
 

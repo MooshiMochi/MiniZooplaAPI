@@ -52,12 +52,12 @@ cp .env.example .env
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `MINI_ZOOLA_HOST` | `127.0.0.1` | Bind address. Defaults to **localhost only** (safe — Cloudflare Tunnel reaches it). Set `0.0.0.0` only if you intentionally expose the port directly. |
-| `MINI_ZOOLA_PORT` | `8000` | Listen port. |
-| `MINI_ZOOLA_ADMIN_KEY` | _(empty)_ | Required to enable `/admin/*` key management. Generate with `openssl rand -hex 24`. |
-| `MINI_ZOOLA_RATE_LIMIT` | `60` | Default requests/minute per key owner. |
-| `MINI_ZOOLA_CACHE_TTL` | `300` | Response cache TTL (seconds) — avoids re-scraping the same branch. |
-| `MINI_ZOOLA_KEYS_DB` | `keys.db` | Path to the API-key store (SQLite). |
+| `MINI_ZOOPLA_HOST` | `127.0.0.1` | Bind address. Defaults to **localhost only** (safe — Cloudflare Tunnel reaches it). Set `0.0.0.0` only if you intentionally expose the port directly. |
+| `MINI_ZOOPLA_PORT` | `8000` | Listen port. |
+| `MINI_ZOOPLA_ADMIN_KEY` | _(empty)_ | Required to enable `/admin/*` key management. Generate with `openssl rand -hex 24`. |
+| `MINI_ZOOPLA_RATE_LIMIT` | `60` | Default requests/minute per key owner. |
+| `MINI_ZOOPLA_CACHE_TTL` | `300` | Response cache TTL (seconds) — avoids re-scraping the same branch. |
+| `MINI_ZOOPLA_KEYS_DB` | `keys.db` | Path to the API-key store (SQLite). |
 
 > Never commit your real `.env` — it's gitignored. Only `.env.example` is tracked.
 
@@ -165,11 +165,11 @@ ExecStart=/opt/minizoopla/venv/bin/python main.py
 Restart=always
 RestartSec=5
 # Bind is localhost by default (127.0.0.1). Set secrets here, never in source control.
-Environment=MINI_ZOOLA_HOST=127.0.0.1
-Environment=MINI_ZOOLA_PORT=8000
-Environment=MINI_ZOOLA_ADMIN_KEY=REPLACE_WITH_openssl_rand_-hex_24
-Environment=MINI_ZOOLA_RATE_LIMIT=60
-Environment=MINI_ZOOLA_CACHE_TTL=300
+Environment=MINI_ZOOPLA_HOST=127.0.0.1
+Environment=MINI_ZOOPLA_PORT=8000
+Environment=MINI_ZOOPLA_ADMIN_KEY=REPLACE_WITH_openssl_rand_-hex_24
+Environment=MINI_ZOOPLA_RATE_LIMIT=60
+Environment=MINI_ZOOPLA_CACHE_TTL=300
 
 [Install]
 WantedBy=multi-user.target
@@ -220,11 +220,11 @@ module.exports = {
     max_memory_restart: '1G',
     env: {
       // Set secrets OUTSIDE source control, e.g. in your shell / a non-committed .env
-      MINI_ZOOLA_HOST: process.env.MINI_ZOOLA_HOST || '127.0.0.1',
-      MINI_ZOOLA_PORT: process.env.MINI_ZOOLA_PORT || '8000',
-      MINI_ZOOLA_ADMIN_KEY: process.env.MINI_ZOOLA_ADMIN_KEY,
-      MINI_ZOOLA_RATE_LIMIT: process.env.MINI_ZOOLA_RATE_LIMIT || '60',
-      MINI_ZOOLA_CACHE_TTL: process.env.MINI_ZOOLA_CACHE_TTL || '300',
+      MINI_ZOOPLA_HOST: process.env.MINI_ZOOPLA_HOST || '127.0.0.1',
+      MINI_ZOOPLA_PORT: process.env.MINI_ZOOPLA_PORT || '8000',
+      MINI_ZOOPLA_ADMIN_KEY: process.env.MINI_ZOOPLA_ADMIN_KEY,
+      MINI_ZOOPLA_RATE_LIMIT: process.env.MINI_ZOOPLA_RATE_LIMIT || '60',
+      MINI_ZOOPLA_CACHE_TTL: process.env.MINI_ZOOPLA_CACHE_TTL || '300',
     },
   }],
 };
@@ -232,7 +232,7 @@ module.exports = {
 
 ```bash
 # Load env first (never commit the file), then start:
-export MINI_ZOOLA_ADMIN_KEY="$(openssl rand -hex 24)"
+export MINI_ZOOPLA_ADMIN_KEY="$(openssl rand -hex 24)"
 pm2 start ecosystem.config.cjs
 pm2 save
 ```
@@ -340,7 +340,7 @@ key is scoped at the **application layer**:
 - `allowed_branches` — optional comma-separated list of branch ids the key may query.
   A key with `allowed_branches=["12345"]` gets `403` on any other branch. Empty/`""`
   means "any branch".
-- `rate_limit` — per-owner requests/minute. Defaults to `MINI_ZOOLA_RATE_LIMIT` (60).
+- `rate_limit` — per-owner requests/minute. Defaults to `MINI_ZOOPLA_RATE_LIMIT` (60).
 - `active` — soft-delete via revoke (no row deletion, so audit history survives).
 
 This gives you per-client isolation (the "R" in RLS) without a separate database
@@ -351,12 +351,12 @@ Postgres backend — the `authenticate`/`enforce_branch_access` logic stays the 
 
 ```bash
 # Required to enable key management endpoints (/admin/*):
-export MINI_ZOOLA_ADMIN_KEY="$(openssl rand -hex 24)"   # the one key that can mint others
+export MINI_ZOOPLA_ADMIN_KEY="$(openssl rand -hex 24)"   # the one key that can mint others
 
 # Optional tuning (with sane defaults):
-export MINI_ZOOLA_RATE_LIMIT="60"     # default req/min per owner
-export MINI_ZOOLA_CACHE_TTL="300"     # seconds; cached responses skip re-scraping
-export MINI_ZOOLA_KEYS_DB="keys.db"   # path to the key store
+export MINI_ZOOPLA_RATE_LIMIT="60"     # default req/min per owner
+export MINI_ZOOPLA_CACHE_TTL="300"     # seconds; cached responses skip re-scraping
+export MINI_ZOOPLA_KEYS_DB="keys.db"   # path to the key store
 ```
 
 ### Create and manage keys (admin)
@@ -364,18 +364,18 @@ export MINI_ZOOLA_KEYS_DB="keys.db"   # path to the key store
 ```bash
 # Create a key scoped to one branch for a Google Sheets user
 curl -X POST https://your-tunnel.yourdomain.com/admin/keys \
-  -H "X-Admin-Key: $MINI_ZOOLA_ADMIN_KEY" \
+  -H "X-Admin-Key: $MINI_ZOOPLA_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{"owner":"sheets_user","name":"google_sheets","allowed_branches":["12345"],"rate_limit":60}'
 
 # -> {"key":"mz_xxxx...","owner":"sheets_user","note":"Store this key securely; it is shown only once."}
 
 # List keys (hashes never returned)
-curl https://your-tunnel.yourdomain.com/admin/keys -H "X-Admin-Key: $MINI_ZOOLA_ADMIN_KEY"
+curl https://your-tunnel.yourdomain.com/admin/keys -H "X-Admin-Key: $MINI_ZOOPLA_ADMIN_KEY"
 
 # Revoke a key (soft delete)
 curl -X DELETE https://your-tunnel.yourdomain.com/admin/keys/<key_id> \
-  -H "X-Admin-Key: $MINI_ZOOLA_ADMIN_KEY"
+  -H "X-Admin-Key: $MINI_ZOOPLA_ADMIN_KEY"
 ```
 
 ### Call the API with a key
@@ -393,7 +393,7 @@ and add the header via Apps Script, or pass the key as a query param if you pref
 the endpoint also accepts `?api_key=mz_xxxx...` as a fallback to the header.
 
 > Security notes:
-> - Never commit `keys.db` or `MINI_ZOOLA_ADMIN_KEY`. Both are in `.gitignore`.
+> - Never commit `keys.db` or `MINI_ZOOPLA_ADMIN_KEY`. Both are in `.gitignore`.
 > - Rotate the admin key by changing the env var and revoking old client keys.
 > - Rate limiting is an in-memory fixed window (per owner); it resets on restart and is
 >   not shared across multiple API processes. Fine for a single-instance personal API.
