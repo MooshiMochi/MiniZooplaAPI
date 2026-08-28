@@ -485,6 +485,23 @@ def _classify_listing_status(card_text: str) -> str:
     return "Available"
 
 
+def _card_text(row: Selector) -> str:
+    """Return the full visible text of a card row (all descendant text nodes).
+
+    scrapling's `row.text` returns only the row's DIRECT text node, which is
+    empty when the text lives in nested elements (e.g. Zoopla's listing-status
+    pill: <ul class='statusListSlim'>...<div>Let agreed</div>). Walking ALL
+    descendant leaf text recovers it. Scoped to the row, so the page footer's
+    "Sold house prices" wording can't leak in.
+    """
+    parts = []
+    for leaf in row.css("*", auto_save=False):
+        t = (leaf.text or "").strip()
+        if t:
+            parts.append(t)
+    return " ".join(parts)
+
+
 # ============================================================================
 # Detail-page extraction helpers
 # ============================================================================
@@ -1053,8 +1070,11 @@ def parse_listing(row: Selector, listing_type: str, cards: dict = None) -> Optio
                 image_url = src
 
         # Transactional status from the card's overlay badge. Build the whole
-        # card text once (scoped to this row) and classify it.
-        card_text = (row.text or "")
+        # Transactional status from the card's overlay badge. Build the card's
+        # FULL descendant text (scoped to this row) and classify it. Zoopla's
+        # status pill text lives in a nested <div> inside the statusListSlim
+        # <ul>, so row.text (direct-only) misses it — we must walk descendants.
+        card_text = _card_text(row)
         listing_status = _classify_listing_status(card_text)
 
         return Property(
