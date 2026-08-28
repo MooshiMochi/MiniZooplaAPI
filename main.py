@@ -1158,6 +1158,7 @@ async def get_agency_listings(
 @app.get("/api/property/{listing_id}")
 async def get_property_details(
     listing_id: str,
+    section: str = Query("rent", description="rent or sale — must match the listing's section (the card's listing_url is /to-rent/details/... or /for-sale/details/...). Wrong section 404s."),
     fmt: str = Query("json", description="json or csv"),
     record: dict = Depends(authenticate),
 ):
@@ -1170,8 +1171,10 @@ async def get_property_details(
       2. /api/property/{listing_id}         -> details for one listing (fast)
 
     `listing_id` is the numeric ID from a card's `listing_url`
-    (.../details/<id>/). It is turned into the canonical Zoopla details URL,
-    which is also returned in the response so callers can self-correct.
+    (.../to-rent/details/<id>/ or .../for-sale/details/<id>/). Zoopla requires
+    the section segment in the URL, so pass `section=rent` (default) or
+    `section=sale` to match the card. The canonical URL is returned in the
+    response (`listing_url`) so callers can self-correct a wrong section.
     """
     # 1. Rate limit (per owner)
     limit = record["rate_limit"] or DEFAULT_RATE_LIMIT
@@ -1182,9 +1185,14 @@ async def get_property_details(
     if not listing_id.isdigit():
         raise HTTPException(status_code=400, detail="listing_id must be the numeric Zoopla listing ID (digits only)")
 
-    listing_url = f"https://www.zoopla.co.uk/details/{listing_id}/"
+    section = section.strip().lower()
+    if section not in ("rent", "sale"):
+        raise HTTPException(status_code=400, detail="section must be 'rent' or 'sale'")
+    section_path = "to-rent" if section == "rent" else "for-sale"
 
-    cache_key = ("property", listing_id)
+    listing_url = f"https://www.zoopla.co.uk/{section_path}/details/{listing_id}/"
+
+    cache_key = ("property", section, listing_id)
     cached = cache.get(cache_key)
     if cached is not None:
         prop = cached
