@@ -732,6 +732,7 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
                         furnished state, EPC, features, description, flags etc.
     """
     properties: List[Property] = []
+    start = time.time()
     listing_type = listing_type.lower()
     if listing_type not in ("rent", "sale"):
         listing_type = "rent"
@@ -852,7 +853,10 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
         logger.info("Detail fetch complete: %s/%s listings enriched",
                      sum(1 for p in properties if p.description), len(properties))
 
-    return properties
+        elapsed = time.time() - start
+        logger.info("Scrape complete in %.2fs (%s listings, details=%s)",
+                    elapsed, len(properties), bool(fetch_details))
+        return properties
 
 
 def _scrape_property_details(listing_url: str) -> dict:
