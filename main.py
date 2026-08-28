@@ -874,9 +874,8 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
             logger.error("Error on page %s: %s", page, e)
             break
 
-    # Convert card dict to list
-    if cards:
-        properties = list(cards.values())
+    # Convert card dict to list (always assign, so an empty result is [] not None).
+    properties: List[Property] = list(cards.values())
 
     # Second pass: fetch detail pages for each unique listing (if requested).
     # Run them CONCURRENTLY across the browser pool so N listings take ~1 fetch
@@ -908,10 +907,10 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
         logger.info("Detail fetch complete: %s/%s listings enriched",
                      sum(1 for p in properties if p.description), len(properties))
 
-        elapsed = time.time() - start
-        logger.info("Scrape complete in %.2fs (%s listings, details=%s)",
-                    elapsed, len(properties), bool(fetch_details))
-        return properties
+    elapsed = time.time() - start
+    logger.info("Scrape complete in %.2fs (%s listings, details=%s)",
+                elapsed, len(properties), bool(fetch_details))
+    return properties
 
 
 def _scrape_property_details(listing_url: str) -> dict:
