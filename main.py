@@ -66,7 +66,7 @@ _root.addHandler(_stderr)
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Mini Zoopla API", version="1.2.0")
+app = FastAPI(title="Mini Zoopla API", version="1.3.0")
 
 # Enable adaptive mode globally
 StealthyFetcher.adaptive = True
@@ -205,7 +205,6 @@ CACHE_TTL = int(os.getenv("MINI_ZOOPLA_CACHE_TTL", "300"))            # seconds
 ADMIN_KEY = os.getenv("MINI_ZOOPLA_ADMIN_KEY")                        # if set, /admin/* enabled
 HOST = os.getenv("MINI_ZOOPLA_HOST", "127.0.0.1")                     # bind address (default: localhost only)
 PORT = int(os.getenv("MINI_ZOOPLA_PORT", "8000"))                     # listen port
-FETCH_DETAILS_DEFAULT = os.getenv("MINI_ZOOPLA_FETCH_DETAILS", "true").lower() == "true"
 
 # ----------------------------------------------------------------------------
 # API key store (SQLite). Keys are hashed (SHA-256); plaintext shown once.
@@ -1063,7 +1062,7 @@ async def get_agency_listings(
     max_pages: int = Query(3, ge=1, le=10, description="Maximum pages to scrape"),
     listing_type: str = Query("rent", description="rent or sale"),
     fmt: str = Query("json", description="json or csv"),
-    details: bool = Query(FETCH_DETAILS_DEFAULT, description="Fetch each listing's detail page for enriched data (default: true)"),
+    details: bool = Query(False, description="If true, also fetch each listing's detail page in this single request (can exceed Cloudflare's 125s limit for large agencies). Default false returns cards only — pair with /api/property/{listing_id} for lazy per-listing enrichment."),
     record: dict = Depends(authenticate),
 ):
     # 1. Rate limit (per owner)
@@ -1091,6 +1090,73 @@ async def get_agency_listings(
         return PlainTextResponse(properties_to_csv(properties), media_type="text/csv",
                                  headers={"Content-Disposition": f'attachment; filename="agency_{branch_id}_{listing_type}.csv"'})
     return AgencyListingsResponse(agency=branch_id, listing_type=listing_type, properties=properties, total=len(properties), cached=False)
+
+
+@app.get("/api/property/{listing_id}")
+async def get_property_details(
+    listing_id: str,
+    fmt: str = Query("json", description="json or csv"),
+    record: dict = Depends(authenticate),
+):
+    """Fetch enriched detail data for a single Zoopla listing.
+
+    Designed as the lazy/per-listing half of the two-trigger workflow so each
+    HTTP request stays well under Cloudflare's 125s limit:
+
+      1. /api/agency/{branch_id}            -> cards only (fast)
+      2. /api/property/{listing_id}         -> details for one listing (fast)
+
+    `listing_id` is the numeric ID from a card's `listing_url`
+    (.../details/<id>/). It is turned into the canonical Zoopla details URL,
+    which is also returned in the response so callers can self-correct.
+    """
+    # 1. Rate limit (per owner)
+    limit = record["rate_limit"] or DEFAULT_RATE_LIMIT
+    if not limiter.allow(record["owner"], limit):
+        raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({limit}/min for owner '{record['owner']}')")
+
+    listing_id = listing_id.strip()
+    if not listing_id.isdigit():
+        raise HTTPException(status_code=400, detail="listing_id must be the numeric Zoopla listing ID (digits only)")
+
+    listing_url = f"https://www.zoopla.co.uk/details/{listing_id}/"
+
+    cache_key = ("property", listing_id)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        prop = cached
+        cached_flag = True
+    else:
+        loop = asyncio.get_event_loop()
+        # Reuse the pooled browser detail fetch. Returns a dict of extra fields
+        # (or {} on failure), so wrap it into a Property built from the URL.
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            detail_fields = await loop.run_in_executor(pool, _scrape_property_details, listing_url)
+        if not detail_fields:
+            # Surface a 502 so app-script triggers can detect + retry cleanly
+            # (transient Cloudflare challenge / empty body).
+            raise HTTPException(status_code=502, detail="Failed to scrape detail page (likely bot-challenge or empty body)")
+        # Keep only keys that are valid Property fields (tolerate schema drift
+        # in the extractor without 500-ing the endpoint).
+        valid = {k: v for k, v in detail_fields.items() if k in Property.model_fields}
+        prop = Property(
+            listing_id=listing_id,
+            title="",
+            price="",
+            address="",
+            listing_type=None,
+            listing_url=listing_url,
+            **valid,
+        )
+        cache.set(cache_key, prop)
+        cached_flag = False
+
+    if fmt == "csv":
+        return PlainTextResponse(
+            properties_to_csv([prop]), media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="property_{listing_id}.csv"'},
+        )
+    return prop.model_dump()
 
 
 # ----------------------------------------------------------------------------
