@@ -8,6 +8,7 @@ import re
 import secrets
 import sqlite3
 import string
+import sys
 import threading
 import time
 import concurrent.futures
@@ -42,7 +43,26 @@ def _load_dotenv(path: str = ".env") -> None:
 
 _load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+# Route DEBUG/INFO to stdout and WARNING+ (incl. ERROR) to stderr, so pm2's
+# stdout/stderr split is meaningful. Configured on the root logger so third-party
+# loggers (scrapling, uvicorn, etc.) inherit it too.
+class _StdoutFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno <= logging.INFO
+
+
+_root = logging.getLogger()
+_root.setLevel(logging.DEBUG)
+_stdout = logging.StreamHandler(sys.stdout)
+_stdout.addFilter(_StdoutFilter())
+_stderr = logging.StreamHandler(sys.stderr)
+_stderr.setLevel(logging.WARNING)
+_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+_stdout.setFormatter(_formatter)
+_stderr.setFormatter(_formatter)
+_root.addHandler(_stdout)
+_root.addHandler(_stderr)
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Mini Zoopla API", version="1.2.0")
