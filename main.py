@@ -11,6 +11,7 @@ import string
 import sys
 import threading
 import time
+import itertools
 import concurrent.futures
 import atexit
 import hashlib
@@ -77,99 +78,121 @@ StealthyFetcher.adaptive = True
 _STEALTH_PARSER_ARGS = StealthyFetcher._generate_parser_arguments()
 
 # ============================================================================
-# Persistent browser session
+# Persistent browser session pool
 # ----------------------------------------------------------------------------
-# StealthyFetcher.fetch() is a thin wrapper:
-#     with StealthySession(**kwargs) as engine:
-#         return engine.fetch(url)
-# i.e. it launches a brand-new Chromium instance AND tears it down on *every*
-# single request. For an agency scrape that "forks" into a detail-page pass,
-# that's one browser launch per search page + one per listing detail page
-# (≈ 1 + max_pages + N listings). Each launch costs several seconds of
-# browser startup, which dominates latency.
+# Zoopla sits behind Cloudflare, so we *must* use a stealthy browser — a plain
+# HTTP request returns 403 "Just a moment". StealthyFetcher.fetch() launches a
+# fresh Chromium per call, which dominates latency.
 #
-# We instead keep ONE StealthySession open for the lifetime of the process and
-# reuse it for every page + detail fetch. A single scrape now pays the browser
-# launch cost exactly once (and never again, because the session stays warm
-# between requests). The session is guarded by a lock so concurrent requests
-# don't drive the same browser at once, and it auto-rebuilds if it ever dies.
-# ============================================================================
-_SESSION_LOCK = threading.RLock()
-_shared_session: Optional["StealthySession"] = None
-
 # Playwright's *synchronous* API binds a greenlet to the OS thread that created
-# the browser. If the shared session is touched from a different thread than
-# the one that built it, Playwright raises "cannot switch to a different thread
-# (which happens to have exited)". To avoid that, EVERY browser operation
-# (session build/start AND every .fetch) is dispatched onto this single
-# dedicated thread, so the greenlet and the browser always live together.
-_BROWSER_POOL = concurrent.futures.ThreadPoolExecutor(
-    max_workers=1, thread_name_prefix="zoopla-browser"
-)
+# the browser. A browser may therefore only be driven from the thread that
+# built it (otherwise: "cannot switch to a different thread"). So instead of one
+# shared browser, we keep a POOL of `MINI_ZOOPLA_BROWSER_WORKERS` browsers, each
+# owned by its own single-threaded worker. The search fetch and every detail
+# fetch are dispatched to a worker thread, so:
+#   * only `MINI_ZOOPLA_BROWSER_WORKERS` browser launches happen per process
+#   * the N detail-page fetches run CONCURRENTLY across the pool, so latency is
+#     ~one fetch instead of N sequential fetches (well under 5s on warm calls).
+# The pool is lazily warmed on first use and rebuilt if a worker dies.
+# ============================================================================
+BROWSER_WORKERS = int(os.getenv("MINI_ZOOPLA_BROWSER_WORKERS", "4"))
 
-
-def _fetch(session: "StealthySession", url: str, **kwargs) -> "Response":
-    """Thread-safe fetch on a shared stealthy session.
-
-    The actual browser navigation is run on the dedicated browser thread
-    (see _BROWSER_POOL) so Playwright's greenlet never crosses a thread
-    boundary. The result is handed back to whatever thread called us.
-    """
-    return _BROWSER_POOL.submit(lambda: session.fetch(url, **kwargs)).result()
-
-
-def _build_session() -> "StealthySession":
-    """Create and start a persistent stealthy browser session (on the browser thread)."""
-    return _BROWSER_POOL.submit(_build_session_impl).result()
+# One executor per worker thread. Each executor has exactly one worker so its
+# browser is always driven from the same thread. Builds/starts and every .fetch
+# are submitted to the owning executor.
+_BROWSER_EXECUTORS: List[concurrent.futures.ThreadPoolExecutor] = []
+_BROWSER_SESSIONS: List[Optional["StealthySession"]] = []
+_POOL_LOCK = threading.RLock()
+_next_worker = itertools.count().__next__  # round-robin cursor
 
 
 def _build_session_impl() -> "StealthySession":
+    """Create + start a persistent stealthy session (runs on its owner thread)."""
     session = StealthySession(
         headless=True,
         network_idle=True,
         solve_cloudflare=True,
-        # A few ready tabs so a busy burst of detail fetches doesn't queue.
+        # A few ready tabs so a burst of fetches on this one worker doesn't queue.
         max_pages=4,
     )
     session.start()
     return session
 
 
-def get_session() -> "StealthySession":
-    """Return the process-wide, always-open browser session.
+def _ensure_pool() -> None:
+    """Lazily build the worker pool on first use (idempotent, thread-safe)."""
+    global _BROWSER_EXECUTORS, _BROWSER_SESSIONS
+    with _POOL_LOCK:
+        if _BROWSER_EXECUTORS:
+            return
+        executors = []
+        sessions = []
+        for i in range(max(1, BROWSER_WORKERS)):
+            ex = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"zoopla-browser-{i}"
+            )
+            executors.append(ex)
+            sessions.append(ex.submit(_build_session_impl).result())
+        _BROWSER_EXECUTORS = executors
+        _BROWSER_SESSIONS = sessions
 
-    Lazily starts one on first use on the dedicated browser thread (so the
-    greenlet and browser live together). If the session has died for any
-    reason it is transparently rebuilt.
-    """
-    global _shared_session
-    with _SESSION_LOCK:
-        if _shared_session is None:
-            _shared_session = _build_session()
-        # If it crashed between calls, rebuild it.
-        if not getattr(_shared_session, "_is_alive", False):
-            try:
-                _shared_session.close()
-            except Exception:
-                pass
-            _shared_session = _build_session()
-        return _shared_session
+
+def _repair_session(idx: int) -> None:
+    """Rebuild a dead worker's browser (caller holds _POOL_LOCK)."""
+    try:
+        old = _BROWSER_SESSIONS[idx]
+        if old is not None:
+            _BROWSER_EXECUTORS[idx].submit(old.close).result(timeout=30)
+    except Exception:
+        pass
+    _BROWSER_SESSIONS[idx] = _BROWSER_EXECUTORS[idx].submit(_build_session_impl).result()
+
+
+def _get_worker() -> int:
+    """Return the index of the next worker in round-robin order."""
+    _ensure_pool()
+    return _next_worker() % len(_BROWSER_EXECUTORS)
+
+
+def _fetch_on_worker(idx: int, url: str, **kwargs) -> "Response":
+    """Run a fetch on worker `idx`'s browser (on its own thread)."""
+    with _POOL_LOCK:
+        session = _BROWSER_SESSIONS[idx]
+        if session is None or not getattr(session, "_is_alive", False):
+            _repair_session(idx)
+            session = _BROWSER_SESSIONS[idx]
+    # Submit the navigation to the worker's thread (keeps the greenlet in-place).
+    return _BROWSER_EXECUTORS[idx].submit(lambda: session.fetch(url, **kwargs)).result()
+
+
+def get_session() -> "StealthySession":
+    """Process-wide warm browser. Returns the next pooled session; callers that
+    need a specific browser should use fetch_via_browser() instead."""
+    _ensure_pool()
+    return _BROWSER_SESSIONS[_next_worker() % len(_BROWSER_SESSIONS)]
+
+
+def fetch_via_browser(url: str, **kwargs) -> "Response":
+    """Fetch a URL on the next available worker's browser (round-robin)."""
+    return _fetch_on_worker(_get_worker(), url, **kwargs)
 
 
 def close_session() -> None:
-    """Tear down the shared browser session (e.g. on shutdown)."""
-    global _shared_session
-    with _SESSION_LOCK:
-        if _shared_session is not None:
-            session = _shared_session
-            _shared_session = None
+    """Tear down the whole worker pool (e.g. on shutdown)."""
+    global _BROWSER_EXECUTORS, _BROWSER_SESSIONS
+    with _POOL_LOCK:
+        executors, sessions = _BROWSER_EXECUTORS, _BROWSER_SESSIONS
+        _BROWSER_EXECUTORS, _BROWSER_SESSIONS = [], []
+    for ex, sess in zip(executors, sessions):
+        if sess is not None:
             try:
-                _BROWSER_POOL.submit(session.close).result(timeout=30)
+                ex.submit(sess.close).result(timeout=30)
             except Exception:
                 pass
+        ex.shutdown(wait=False)
 
 
-# Cleanly shut down the browser when the process exits.
+# Cleanly shut down the browser pool when the process exits.
 atexit.register(close_session)
 
 
@@ -715,8 +738,7 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
     section = "for-sale" if listing_type == "sale" else "to-rent"
     base_url = f"https://www.zoopla.co.uk/{section}/property/uk/?branch_id={branch_id}&include_sold=true&include_rented=true"
 
-    # Reuse ONE always-open browser session for the whole scrape (pages + details).
-    session = get_session()
+    # Use the warm browser pool for every fetch.
     page = 1
     seen_listing_ids: set = set()  # dedupe across pages in case of overlap
 
@@ -727,8 +749,7 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
         url = f"{base_url}&pn={page}" if page > 1 else base_url
         logger.info("Scraping page %s: %s", page, url)
         try:
-            response = _fetch(
-                session,
+            response = fetch_via_browser(
                 url,
                 wait_selector='[data-testid="listing-card-content"]',
                 wait_selector_state="attached",
@@ -801,45 +822,48 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
     if cards:
         properties = list(cards.values())
 
-    # Second pass: fetch detail pages for each unique listing (if requested)
+    # Second pass: fetch detail pages for each unique listing (if requested).
+    # Run them CONCURRENTLY across the browser pool so N listings take ~1 fetch
+    # instead of N sequential ones (keeps the whole scrape well under 5s).
     if fetch_details and properties:
-        logger.info("Fetching detail pages for %s listings...", len(properties))
-        for i, prop in enumerate(properties):
+        logger.info("Fetching detail pages for %s listings (parallel)...", len(properties))
+
+        def _enrich_one(i: int, prop: Property) -> tuple:
             if not prop.listing_url:
                 logger.debug("Listing %s has no URL, skipping detail fetch", prop.listing_id)
-                continue
+                return i, None
             try:
-                detail_fields = _scrape_property_details(prop.listing_url, session)
+                detail_fields = _scrape_property_details(prop.listing_url)
                 if detail_fields:
-                    properties[i] = _enrich_property(prop, detail_fields)
+                    return i, _enrich_property(prop, detail_fields)
             except Exception as e:
                 logger.warning("Failed to fetch details for %s (%s): %s", prop.listing_id, prop.listing_url, e)
-            # Be polite — small delay between detail fetches
-            if i < len(properties) - 1:
-                time.sleep(0.5)
+            return i, None
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(properties), max(1, BROWSER_WORKERS))
+        ) as detail_pool:
+            futures = [detail_pool.submit(_enrich_one, i, prop) for i, prop in enumerate(properties)]
+            for fut in concurrent.futures.as_completed(futures):
+                i, enriched = fut.result()
+                if enriched is not None:
+                    properties[i] = enriched
+
         logger.info("Detail fetch complete: %s/%s listings enriched",
                      sum(1 for p in properties if p.description), len(properties))
 
     return properties
 
 
-def _scrape_property_details(listing_url: str, session: Optional["StealthySession"] = None) -> dict:
+def _scrape_property_details(listing_url: str) -> dict:
     """Fetch and parse a single Zoopla property detail page.
 
     Returns a dict of extra fields suitable for passing to _enrich_property,
-    or an empty dict on failure.
-
-    Args:
-        listing_url: The /details/ URL to scrape.
-        session:     An already-open StealthySession to reuse (avoids launching
-                     a new browser per listing). If None, the shared warm
-                     session is used via get_session().
+    or an empty dict on failure. Uses the warm browser pool (a worker is
+    picked round-robin, so many concurrent calls fan out across browsers).
     """
-    if session is None:
-        session = get_session()
     try:
-        response = _fetch(
-            session,
+        response = fetch_via_browser(
             listing_url,
             wait_selector='[data-testid="listing-card-content"], article, main',
             wait_selector_state="attached",
