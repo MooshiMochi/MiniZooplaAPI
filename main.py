@@ -10,6 +10,7 @@ import sqlite3
 import string
 import threading
 import time
+import concurrent.futures
 import atexit
 import hashlib
 from collections import defaultdict
@@ -74,24 +75,35 @@ _STEALTH_PARSER_ARGS = StealthyFetcher._generate_parser_arguments()
 # don't drive the same browser at once, and it auto-rebuilds if it ever dies.
 # ============================================================================
 _SESSION_LOCK = threading.RLock()
-_FETCH_LOCK = threading.Lock()  # serializes .fetch() on the shared browser across threads
 _shared_session: Optional["StealthySession"] = None
+
+# Playwright's *synchronous* API binds a greenlet to the OS thread that created
+# the browser. If the shared session is touched from a different thread than
+# the one that built it, Playwright raises "cannot switch to a different thread
+# (which happens to have exited)". To avoid that, EVERY browser operation
+# (session build/start AND every .fetch) is dispatched onto this single
+# dedicated thread, so the greenlet and the browser always live together.
+_BROWSER_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="zoopla-browser"
+)
 
 
 def _fetch(session: "StealthySession", url: str, **kwargs) -> "Response":
     """Thread-safe fetch on a shared stealthy session.
 
-    Playwright's sync browser context is not safe for concurrent page
-    navigation from multiple threads, so we serialize every fetch through a
-    single process-wide lock. This keeps ONE browser open while still allowing
-    the server to serve requests (they just queue for the browser in turn).
+    The actual browser navigation is run on the dedicated browser thread
+    (see _BROWSER_POOL) so Playwright's greenlet never crosses a thread
+    boundary. The result is handed back to whatever thread called us.
     """
-    with _FETCH_LOCK:
-        return session.fetch(url, **kwargs)
+    return _BROWSER_POOL.submit(lambda: session.fetch(url, **kwargs)).result()
 
 
 def _build_session() -> "StealthySession":
-    """Create and start a persistent stealthy browser session."""
+    """Create and start a persistent stealthy browser session (on the browser thread)."""
+    return _BROWSER_POOL.submit(_build_session_impl).result()
+
+
+def _build_session_impl() -> "StealthySession":
     session = StealthySession(
         headless=True,
         network_idle=True,
@@ -106,9 +118,9 @@ def _build_session() -> "StealthySession":
 def get_session() -> "StealthySession":
     """Return the process-wide, always-open browser session.
 
-    Lazily starts one on first use (in a worker thread, so the browser boots
-    inside the same event loop / thread that will use it). If the session has
-    died for any reason it is transparently rebuilt.
+    Lazily starts one on first use on the dedicated browser thread (so the
+    greenlet and browser live together). If the session has died for any
+    reason it is transparently rebuilt.
     """
     global _shared_session
     with _SESSION_LOCK:
@@ -129,11 +141,12 @@ def close_session() -> None:
     global _shared_session
     with _SESSION_LOCK:
         if _shared_session is not None:
+            session = _shared_session
+            _shared_session = None
             try:
-                _shared_session.close()
+                _BROWSER_POOL.submit(session.close).result(timeout=30)
             except Exception:
                 pass
-            _shared_session = None
 
 
 # Cleanly shut down the browser when the process exits.
@@ -457,15 +470,32 @@ def _extract_features_and_description(page_selector: Selector) -> tuple:
     description: Optional[str] = None
 
     # Try to find the "About this property" section and its children.
+    # NOTE: scrapling's Selector (lxml-backed) does NOT support Playwright's
+    # :has-text() pseudo-class, so we match candidate nodes with plain CSS and
+    # then filter by visible text in Python.
     about_node = page_selector.css(
-        'h2:has-text("About this property"), [class*="aboutThisProperty"], '
-        '[class*="propertyDescription"]',
+        '[class*="aboutThisProperty"], [class*="propertyDescription"], '
+        'h2, [class*="description"]',
         auto_save=False,
     )
 
-    # Strategy 1: grab all <li> / bullet elements inside or near the about section
-    if about_node:
+    # Strategy 0: narrow the candidate set to the node actually headed
+    # "About this property" (h2 + its container), preferring an exact match.
+    about = None
+    for node in about_node:
+        txt = (node.text or "")
+        if "about this property" in txt.lower():
+            about = node
+            # climb to the container that holds the bullets/description
+            parent = node.parent
+            if parent is not None:
+                about = parent
+            break
+    if about is None and about_node:
         about = about_node[0]
+
+    # Strategy 1: grab all <li> / bullet elements inside or near the about section
+    if about is not None:
         # Features are typically <li> elements or div bullets
         feature_nodes = about.css("li, [class*='feature'], [class*='bullet']", auto_save=False)
         for fn in feature_nodes:
@@ -473,11 +503,13 @@ def _extract_features_and_description(page_selector: Selector) -> tuple:
             if txt and len(txt) < 200 and txt not in features:
                 features.append(txt)
         if not features:
-            # Fallback: try immediate text children as bullet items
+            # Fallback: try immediate text children as bullet items.
+            # Skip the section heading itself (e.g. "About this property").
             for child in about.children:
                 txt = (child.text or "").strip()
                 if txt and len(txt) < 200 and txt not in features and len(features) < 30:
-                    features.append(txt)
+                    if "about this property" not in txt.lower():
+                        features.append(txt)
 
     # Strategy 2: if no features found in about section, look for any list on the page
     # that's in the property description area
@@ -1000,7 +1032,6 @@ async def get_agency_listings(
         return AgencyListingsResponse(agency=branch_id, listing_type=listing_type, properties=cached, total=len(cached), cached=True)
 
     loop = asyncio.get_event_loop()
-    import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor() as pool:
         properties = await loop.run_in_executor(pool, scrape_zoopla_agency, branch_id, max_pages, listing_type, details)
 
