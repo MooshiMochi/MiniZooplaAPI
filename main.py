@@ -1,13 +1,16 @@
 import asyncio
 import csv
 import io
+import json
 import logging
 import os
 import re
 import secrets
 import sqlite3
 import string
+import threading
 import time
+import atexit
 import hashlib
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -15,9 +18,9 @@ from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from scrapling.fetchers import StealthyFetcher
+from scrapling.fetchers import StealthyFetcher, StealthySession
 from scrapling import Selector
 
 # Load .env file (if present) into os.environ — no external dependency needed.
@@ -46,6 +49,97 @@ app = FastAPI(title="Mini Zoopla API", version="1.2.0")
 # Enable adaptive mode globally
 StealthyFetcher.adaptive = True
 
+# Parser arguments shared by every StealthySession fetch (computed once, not
+# per request). Mirrors what StealthyFetcher.fetch() injects via
+# cls._generate_parser_arguments(); we reuse the same dict for the persistent
+# session so behaviour matches the original per-call Fetcher exactly.
+_STEALTH_PARSER_ARGS = StealthyFetcher._generate_parser_arguments()
+
+# ============================================================================
+# Persistent browser session
+# ----------------------------------------------------------------------------
+# StealthyFetcher.fetch() is a thin wrapper:
+#     with StealthySession(**kwargs) as engine:
+#         return engine.fetch(url)
+# i.e. it launches a brand-new Chromium instance AND tears it down on *every*
+# single request. For an agency scrape that "forks" into a detail-page pass,
+# that's one browser launch per search page + one per listing detail page
+# (≈ 1 + max_pages + N listings). Each launch costs several seconds of
+# browser startup, which dominates latency.
+#
+# We instead keep ONE StealthySession open for the lifetime of the process and
+# reuse it for every page + detail fetch. A single scrape now pays the browser
+# launch cost exactly once (and never again, because the session stays warm
+# between requests). The session is guarded by a lock so concurrent requests
+# don't drive the same browser at once, and it auto-rebuilds if it ever dies.
+# ============================================================================
+_SESSION_LOCK = threading.RLock()
+_FETCH_LOCK = threading.Lock()  # serializes .fetch() on the shared browser across threads
+_shared_session: Optional["StealthySession"] = None
+
+
+def _fetch(session: "StealthySession", url: str, **kwargs) -> "Response":
+    """Thread-safe fetch on a shared stealthy session.
+
+    Playwright's sync browser context is not safe for concurrent page
+    navigation from multiple threads, so we serialize every fetch through a
+    single process-wide lock. This keeps ONE browser open while still allowing
+    the server to serve requests (they just queue for the browser in turn).
+    """
+    with _FETCH_LOCK:
+        return session.fetch(url, **kwargs)
+
+
+def _build_session() -> "StealthySession":
+    """Create and start a persistent stealthy browser session."""
+    session = StealthySession(
+        headless=True,
+        network_idle=True,
+        solve_cloudflare=True,
+        # A few ready tabs so a busy burst of detail fetches doesn't queue.
+        max_pages=4,
+    )
+    session.start()
+    return session
+
+
+def get_session() -> "StealthySession":
+    """Return the process-wide, always-open browser session.
+
+    Lazily starts one on first use (in a worker thread, so the browser boots
+    inside the same event loop / thread that will use it). If the session has
+    died for any reason it is transparently rebuilt.
+    """
+    global _shared_session
+    with _SESSION_LOCK:
+        if _shared_session is None:
+            _shared_session = _build_session()
+        # If it crashed between calls, rebuild it.
+        if not getattr(_shared_session, "_is_alive", False):
+            try:
+                _shared_session.close()
+            except Exception:
+                pass
+            _shared_session = _build_session()
+        return _shared_session
+
+
+def close_session() -> None:
+    """Tear down the shared browser session (e.g. on shutdown)."""
+    global _shared_session
+    with _SESSION_LOCK:
+        if _shared_session is not None:
+            try:
+                _shared_session.close()
+            except Exception:
+                pass
+            _shared_session = None
+
+
+# Cleanly shut down the browser when the process exits.
+atexit.register(close_session)
+
+
 # ----------------------------------------------------------------------------
 # Config (all via env so nothing secret lands in source control)
 # ----------------------------------------------------------------------------
@@ -55,6 +149,7 @@ CACHE_TTL = int(os.getenv("MINI_ZOOPLA_CACHE_TTL", "300"))            # seconds
 ADMIN_KEY = os.getenv("MINI_ZOOPLA_ADMIN_KEY")                        # if set, /admin/* enabled
 HOST = os.getenv("MINI_ZOOPLA_HOST", "127.0.0.1")                     # bind address (default: localhost only)
 PORT = int(os.getenv("MINI_ZOOPLA_PORT", "8000"))                     # listen port
+FETCH_DETAILS_DEFAULT = os.getenv("MINI_ZOOPLA_FETCH_DETAILS", "true").lower() == "true"
 
 # ----------------------------------------------------------------------------
 # API key store (SQLite). Keys are hashed (SHA-256); plaintext shown once.
@@ -198,10 +293,8 @@ def authenticate(
     return record
 
 
-
-
 # ----------------------------------------------------------------------------
-# Scraper (unchanged adaptive logic)
+# Scraper
 # ----------------------------------------------------------------------------
 ADAPTIVE_CONFIG = {
     "listing_row": {"selector": '[id^="listing_"]', "identifier": "zoopla_listing_row", "auto_save": True},
@@ -218,6 +311,20 @@ BEDS_RE = re.compile(r"(\d+)\s*bed", re.I)
 BATHS_RE = re.compile(r"(\d+)\s*bath", re.I)
 LISTING_ID_RE = re.compile(r"/details/(\d+)/")
 
+# Regexes for detail-page text extraction
+AVAILABLE_RE = re.compile(r"(?:Available\s+(?:from|now|end\s+of)\s+(?:\d{1,2}[/]\d{1,2}[/]\d{2,4}|[A-Z][a-z]+\s+\d{4}|\d{4}))|Just\s+added", re.I)
+FURNISHED_LABEL_RE = re.compile(r"^\s*(Furnished|Unfurnished|Part\s+Furnished|Part-furnished|Semi-furnished|Semi\s+Furnished|Furnished\s+or\s+Unfurnished|Unfurnished\s+or\s+Furnished)\s*$", re.I)
+EPC_RE = re.compile(r"EPC\s+Rating:\s*([A-H])\b", re.I)
+SIZE_RE = re.compile(r"(\d{2,4})\s*(?:sq\.?\s*ft|square\s*(?:feet|ft)|sqft)", re.I)
+DEPOSIT_RE = re.compile(r"Deposit:\s*£?([\d,]+(?:[.,]\d{2})?)", re.I)
+COUNCIL_TAX_RE = re.compile(r"Council\s+Tax\s+Band:\s*([A-Ja-j]|Not\s+yet\s+known|Tbc|TBC|To\s+be\s+confirmed)", re.I)
+HOLDING_DEPOSIT_RE = re.compile(r"Holding\s+Deposit:\s*£?([\d,]+(?:[.,]\d{2})?)", re.I)
+
+# Keywords for inferring boolean flags from features + description text
+PARKING_KEYWORDS = re.compile(r"\b(parking|car\s+parking|driveway|garage|off-street\s+parking|allocated\s+parking|secure\s+parking|on-street\s+parking|parking\s+space)\b", re.I)
+OUTDOOR_KEYWORDS = re.compile(r"\b(garden|patio|yard|outdoor\s+space|terrace|balcony|decking|communal\s+garden|green\s+space|rear\s+garden|front\s+garden|brick\s+work|courtyard)\b", re.I)
+BILLS_KEYWORDS = re.compile(r"\b(bills?\s+inclusive|bills?\s+included|all\s+bills?\s+inclusive|utility\s+bills?\s+included|council\s+tax\s+included)\b", re.I)
+
 
 class Property(BaseModel):
     listing_id: Optional[str] = None
@@ -233,6 +340,33 @@ class Property(BaseModel):
     listing_url: str
     image_url: Optional[str] = None
 
+    # ------------------------------------------------------------------
+    # Detail-page fields (populated when scrape_zoopla_agency fetches
+    # each listing's /details/ page — opt-in via ?details=true)
+    # ------------------------------------------------------------------
+    furnished_state: Optional[str] = None           # canonical from hidden JSON:
+                                                    #   furnished / unfurnished / part_furnished /
+                                                    #   semi_furnished / furnished_or_unfurnished
+    furnished_label: Optional[str] = None           # visible DOM text: "Furnished", "Unfurnished" etc.
+    epc_rating: Optional[str] = None                # single letter A–G (badge + text)
+    available_date: Optional[str] = None            # raw text extracted from page
+    features: List[str] = Field(default_factory=list)  # bullet list from "About this property"
+    description: Optional[str] = None               # full marketing description
+    size_sq_ft: Optional[int] = None                # extracted from description text
+    deposit: Optional[int] = None                   # holding/security deposit in £
+    council_tax_band: Optional[str] = None          # A–J, "Not yet known", "Tbc" etc.
+    parking: bool = False                           # True if any feature/description mentions parking
+    outdoor_space: bool = False                     # True if garden / patio / yard / driveway mentioned
+    bills_included: bool = False                    # True if "bills inclusive" / "bills included" found
+    agent_name: Optional[str] = None                # branch/brand name from hidden JSON
+    num_photos: Optional[int] = None                # from hidden JSON (num_images)
+    has_floorplan: bool = False                     # from hidden JSON (has_floorplan)
+    is_shared_ownership: bool = False               # from hidden JSON
+    is_retirement_home: bool = False                # from hidden JSON
+    tenure: Optional[str] = None                    # from hidden JSON
+    listing_condition: Optional[str] = None         # from hidden JSON: pre-owned / new / etc.
+    property_type_detail: Optional[str] = None      # canonical from hidden JSON (flat, teraced, etc.)
+
 
 class AgencyListingsResponse(BaseModel):
     agency: str
@@ -243,9 +377,16 @@ class AgencyListingsResponse(BaseModel):
 
 
 def _to_int(text: Optional[str]) -> Optional[int]:
-    if not text:
+    if text is None:
         return None
-    digits = re.sub(r"[^\d]", "", text)
+    if isinstance(text, int):
+        return text
+    if isinstance(text, float):
+        return int(text)
+    s = str(text).strip()
+    if not s:
+        return None
+    digits = re.sub(r"[^\d]", "", s)
     return int(digits) if digits else None
 
 
@@ -254,7 +395,267 @@ def _extract_listing_id(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str = "rent") -> List[Property]:
+# ============================================================================
+# Detail-page extraction helpers
+# ============================================================================
+
+def _extract_hidden_json(html_content: str) -> dict:
+    """Extract Zoopla's hidden ListingAnalyticsTaxonomy JSON from the page.
+
+    Zoopla embeds this as a standalone JSON object (no wrapping script tag
+    with a type attribute) inside the HTML.  We hunt for the JSON object
+    that starts with {"__typename":"ListingAnalyticsTaxonomy".
+    """
+    low = html_content
+    start_marker = '{"__typename":"ListingAnalyticsTaxonomy"'
+    idx = low.find(start_marker)
+    if idx < 0:
+        return {}
+
+    # Walk forward to find the matching close brace.
+    depth = 0
+    in_string = False
+    escape_next = False
+    end = idx
+    for i in range(idx, len(low)):
+        ch = low[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if not in_string:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+
+    candidate = low[idx:end]
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        logger.debug("Could not parse hidden JSON from detail page (truncated candidate: %s...)", candidate[:200])
+        return {}
+
+
+def _extract_features_and_description(page_selector: Selector) -> tuple:
+    """Extract the bullet-feature list and the full description from a detail page.
+
+    Zoopla's detail pages structure the description as:
+      - Collapsed teaser (first paragraph under "About this property")
+      - Full description behind a "Read full description" expandable, or
+        the full text visible right after the features bullets.
+    """
+    features: List[str] = []
+    description: Optional[str] = None
+
+    # Try to find the "About this property" section and its children.
+    about_node = page_selector.css(
+        'h2:has-text("About this property"), [class*="aboutThisProperty"], '
+        '[class*="propertyDescription"]',
+        auto_save=False,
+    )
+
+    # Strategy 1: grab all <li> / bullet elements inside or near the about section
+    if about_node:
+        about = about_node[0]
+        # Features are typically <li> elements or div bullets
+        feature_nodes = about.css("li, [class*='feature'], [class*='bullet']", auto_save=False)
+        for fn in feature_nodes:
+            txt = (fn.text or "").strip()
+            if txt and len(txt) < 200 and txt not in features:
+                features.append(txt)
+        if not features:
+            # Fallback: try immediate text children as bullet items
+            for child in about.children:
+                txt = (child.text or "").strip()
+                if txt and len(txt) < 200 and txt not in features and len(features) < 30:
+                    features.append(txt)
+
+    # Strategy 2: if no features found in about section, look for any list on the page
+    # that's in the property description area
+    if not features:
+        full_desc_blocks = page_selector.css(
+            '[class*="description"], [class*="propertyDesc"], '
+            '[data-testid*="description"], article p',
+            auto_save=False,
+        )
+        for block in full_desc_blocks:
+            txt = (block.text or "").strip()
+            if txt and len(txt) > 100 and len(txt) < 5000:
+                description = txt
+                # Try splitting on bullet markers commonly used in Zoopla descriptions
+                for bullet in re.split(r"\n+|•|\*|●|\u2022", txt):
+                    b = bullet.strip()
+                    if b and len(b) < 200 and len(features) < 30:
+                        features.append(b)
+                break
+
+    # If we still have no description, grab the largest text block from the page
+    # that looks like a property description (long paragraph with property terms).
+    if not description:
+        all_text_blocks = page_selector.css("p, div", auto_save=False)
+        best: Optional[str] = None
+        best_len = 0
+        for block in all_text_blocks:
+            txt = (block.text or "").strip()
+            if 200 < len(txt) < 6000 and len(txt) > best_len:
+                # Heuristic: description mentions property terms
+                if re.search(r"property|bedroom|kitchen|bathroom|living|accommodation|let|rent|floor|room", txt, re.I):
+                    best = txt
+                    best_len = len(txt)
+        description = best
+
+    # Deduplicate features while preserving order
+    seen_feat = set()
+    deduped = []
+    for f in features:
+        lf = f.lower()
+        if lf not in seen_feat and len(f.strip()) > 1:
+            seen_feat.add(lf)
+            deduped.append(f.strip())
+    features = deduped[:40]  # cap at 40 features
+
+    return features, description
+
+
+def _extract_bool_flag(text: str, pattern: re.Pattern, default: bool = False) -> bool:
+    """Return True if `pattern` matches `text` (case-insensitive)."""
+    return bool(pattern.search(text))
+
+
+def _parse_detail_page(html_content: str, listing_url: str) -> dict:
+    """Parse a Zoopla property detail page and return a dict of extra fields.
+
+    Extracts:
+      - Hidden JSON (ListingAnalyticsTaxonomy) for canonical structured fields
+      - Visible DOM text for EPC, furnished label, available date, etc.
+      - Full description and feature bullet list
+      - Boolean flags inferred from features + description text
+    """
+    result: dict = {}
+
+    page_selector = Selector(html_content, adaptive=True, url=listing_url)
+
+    # ------------------------------------------------------------------
+    # 1. Hidden JSON (structured canonical data)
+    # ------------------------------------------------------------------
+    hidden = _extract_hidden_json(html_content)
+    if hidden:
+        result["furnished_state"] = hidden.get("furnished_state")
+        result["property_type_detail"] = hidden.get("property_type")
+        result["size_sq_ft"] = _to_int(hidden.get("size_sq_feet"))
+        result["has_floorplan"] = bool(hidden.get("has_floorplan") in (True, "true", "1"))
+        result["is_shared_ownership"] = bool(hidden.get("is_shared_ownership") in (True, "true", "1"))
+        result["is_retirement_home"] = bool(hidden.get("is_retirement_home") in (True, "true", "1"))
+        result["listing_condition"] = hidden.get("listing_condition")
+        result["tenure"] = hidden.get("tenure")
+        result["agent_name"] = hidden.get("branch_name") or hidden.get("brand_name")
+        result["num_photos"] = _to_int(hidden.get("num_images"))
+
+    # ------------------------------------------------------------------
+    # 2. Visible DOM: EPC, furnished label, available date, description
+    # ------------------------------------------------------------------
+    full_text = (page_selector.css("body", auto_save=False) or [None])[0]
+    body_text = (full_text.text if full_text else "").strip()
+
+    # EPC rating: look for "EPC Rating: C" pattern
+    epc_m = EPC_RE.search(body_text)
+    if epc_m:
+        result["epc_rating"] = epc_m.group(1).upper()
+
+    # Furnished label: search for the exact label text near the top of the page
+    # (Zoopla renders it as a label under the EPC rating line)
+    for line in body_text.splitlines():
+        line = line.strip()
+        fm = FURNISHED_LABEL_RE.match(line)
+        if fm:
+            result["furnished_label"] = fm.group(1).strip()
+            # Normalise to lower-case canonical form, but keep the display label
+            break
+
+    # Available date: search the full text for "Available from ..." patterns
+    avail_m = AVAILABLE_RE.search(body_text)
+    if avail_m:
+        result["available_date"] = avail_m.group(0).strip()
+
+    # Features + description
+    features, description = _extract_features_and_description(page_selector)
+    result["features"] = features
+    result["description"] = description
+
+    # ------------------------------------------------------------------
+    # 3. Boolean flags inferred from features + description
+    # ------------------------------------------------------------------
+    combined_text = " ".join(features) + " " + (description or "")
+
+    # Parking
+    result["parking"] = _extract_bool_flag(combined_text, PARKING_KEYWORDS)
+    # Outdoor space
+    result["outdoor_space"] = _extract_bool_flag(combined_text, OUTDOOR_KEYWORDS)
+    # Bills included
+    result["bills_included"] = _extract_bool_flag(combined_text, BILLS_KEYWORDS)
+
+    # ------------------------------------------------------------------
+    # 4. Deposit and council tax from "More information" section
+    # ------------------------------------------------------------------
+    # Deposit: try both "Deposit: £X" and "Holding Deposit: £X"
+    dep_m = DEPOSIT_RE.search(body_text)
+    if dep_m:
+        result["deposit"] = _to_int(dep_m.group(1))
+    # Holding deposit overrides the general deposit if present
+    hd_m = HOLDING_DEPOSIT_RE.search(body_text)
+    if hd_m and not result.get("deposit"):
+        result["deposit"] = _to_int(hd_m.group(1))
+
+    # Council tax band
+    ct_m = COUNCIL_TAX_RE.search(body_text)
+    if ct_m:
+        band = ct_m.group(1).strip()
+        # Normalise "Tbc" / "To be confirmed" to "Not yet known"
+        if band.lower() in ("tbc", "tbc.", "to be confirmed", "to be confirmed."):
+            band = "Not yet known"
+        result["council_tax_band"] = band
+
+    return result
+
+
+def _enrich_property(prop: Property, detail_fields: dict) -> Property:
+    """Apply extracted detail-fields to a Property, preserving existing values."""
+    update_data: dict = {}
+    for key, value in detail_fields.items():
+        # Only set if the property doesn't already have a value for this field
+        current = getattr(prop, key, None)
+        if current is None or current == ( False if isinstance(current, bool) else "" ):
+            update_data[key] = value
+    if update_data:
+        prop = prop.model_copy(update=update_data)
+    return prop
+
+
+# ============================================================================
+# Scraper
+# ============================================================================
+
+def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str = "rent",
+                          fetch_details: bool = True) -> List[Property]:
+    """Scrape Zoopla agency listing cards, optionally fetching each detail page.
+
+    Args:
+        branch_id:      Zoopla branch ID.
+        max_pages:      Maximum search-result pages to crawl (1–10).
+        listing_type:   "rent" or "sale".
+        fetch_details:  If True, after collecting card data, visit each unique
+                        listing's /details/ page and enrich the Property with
+                        furnished state, EPC, features, description, flags etc.
+    """
     properties: List[Property] = []
     listing_type = listing_type.lower()
     if listing_type not in ("rent", "sale"):
@@ -262,22 +663,27 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
     section = "for-sale" if listing_type == "sale" else "to-rent"
     base_url = f"https://www.zoopla.co.uk/{section}/property/uk/?branch_id={branch_id}&include_sold=true&include_rented=true"
 
-    fetcher = StealthyFetcher()
+    # Reuse ONE always-open browser session for the whole scrape (pages + details).
+    session = get_session()
     page = 1
     seen_listing_ids: set = set()  # dedupe across pages in case of overlap
+
+    # First pass: collect cards (listing_id → Property at card level)
+    cards: dict = {}  # listing_id → Property
 
     while page <= max_pages:
         url = f"{base_url}&pn={page}" if page > 1 else base_url
         logger.info("Scraping page %s: %s", page, url)
         try:
-            response = fetcher.fetch(
+            response = _fetch(
+                session,
                 url,
                 wait_selector='[data-testid="listing-card-content"]',
                 wait_selector_state="attached",
                 timeout=60000,
-                headless=True,
                 network_idle=True,
                 solve_cloudflare=True,
+                selector_config=_STEALTH_PARSER_ARGS,
             )
             if response.status >= 400:
                 logger.warning("Fetch failed page %s: %s", page, response.status)
@@ -315,10 +721,9 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
 
             page_count = 0
             for row in rows:
-                prop = parse_listing(row, listing_type)
-                if prop and prop.listing_id and prop.listing_id not in seen_listing_ids:
-                    properties.append(prop)
-                    seen_listing_ids.add(prop.listing_id)
+                prop = parse_listing(row, listing_type, cards)
+                if prop and prop.listing_id and prop.listing_id not in cards:
+                    cards[prop.listing_id] = prop
                     page_count += 1
                 elif prop:
                     # Include it but log the dedup
@@ -339,7 +744,83 @@ def scrape_zoopla_agency(branch_id: str, max_pages: int = 3, listing_type: str =
         except Exception as e:
             logger.error("Error on page %s: %s", page, e)
             break
+
+    # Convert card dict to list
+    if cards:
+        properties = list(cards.values())
+
+    # Second pass: fetch detail pages for each unique listing (if requested)
+    if fetch_details and properties:
+        logger.info("Fetching detail pages for %s listings...", len(properties))
+        for i, prop in enumerate(properties):
+            if not prop.listing_url:
+                logger.debug("Listing %s has no URL, skipping detail fetch", prop.listing_id)
+                continue
+            try:
+                detail_fields = _scrape_property_details(prop.listing_url, session)
+                if detail_fields:
+                    properties[i] = _enrich_property(prop, detail_fields)
+            except Exception as e:
+                logger.warning("Failed to fetch details for %s (%s): %s", prop.listing_id, prop.listing_url, e)
+            # Be polite — small delay between detail fetches
+            if i < len(properties) - 1:
+                time.sleep(0.5)
+        logger.info("Detail fetch complete: %s/%s listings enriched",
+                     sum(1 for p in properties if p.description), len(properties))
+
     return properties
+
+
+def _scrape_property_details(listing_url: str, session: Optional["StealthySession"] = None) -> dict:
+    """Fetch and parse a single Zoopla property detail page.
+
+    Returns a dict of extra fields suitable for passing to _enrich_property,
+    or an empty dict on failure.
+
+    Args:
+        listing_url: The /details/ URL to scrape.
+        session:     An already-open StealthySession to reuse (avoids launching
+                     a new browser per listing). If None, the shared warm
+                     session is used via get_session().
+    """
+    if session is None:
+        session = get_session()
+    try:
+        response = _fetch(
+            session,
+            listing_url,
+            wait_selector='[data-testid="listing-card-content"], article, main',
+            wait_selector_state="attached",
+            timeout=30000,
+            network_idle=True,
+            solve_cloudflare=True,
+            selector_config=_STEALTH_PARSER_ARGS,
+        )
+        if response.status >= 400:
+            logger.warning("Detail page fetch failed for %s: status %s", listing_url, response.status)
+            return {}
+        html_content = response.text or ""
+        if not html_content and response.body:
+            html_content = response.body.decode("utf-8", "ignore") if isinstance(response.body, bytes) else str(response.body)
+        if not html_content:
+            return {}
+        if len(html_content) < 2000:
+            logger.warning("Suspiciously short detail page for %s (%s bytes)", listing_url, len(html_content))
+            return {}
+
+        # Challenge detection
+        low = html_content.lower()
+        if any(kw in low for kw in (
+            "are you a robot", "verify you are human", "checking your browser",
+            "just a moment", "cf-chl", "please enable javascript",
+        )):
+            logger.warning("Bot challenge on detail page: %s", listing_url)
+            return {}
+
+        return _parse_detail_page(html_content, listing_url)
+    except Exception as e:
+        logger.error("Exception scraping detail page %s: %s", listing_url, e)
+        return {}
 
 
 def _has_next_page(selector: Selector, current_page: int) -> bool:
@@ -399,7 +880,8 @@ def _first(node: Selector, selector: str, identifier: str, auto_save: bool):
     return found[0] if found else None
 
 
-def parse_listing(row: Selector, listing_type: str) -> Optional[Property]:
+def parse_listing(row: Selector, listing_type: str, cards: dict = None) -> Optional[Property]:
+    """Parse a single listing card row into a Property (card-level data only)."""
     try:
         price_elem = _first(row, ADAPTIVE_CONFIG["price"]["selector"], ADAPTIVE_CONFIG["price"]["identifier"], ADAPTIVE_CONFIG["price"]["auto_save"])
         price_text = price_elem.text.strip() if price_elem is not None else ""
@@ -464,13 +946,26 @@ def parse_listing(row: Selector, listing_type: str) -> Optional[Property]:
 
 
 def properties_to_csv(properties: List[Property]) -> str:
-    fields = ["listing_id", "title", "price", "price_pcm", "price_per_week", "address",
-              "bedrooms", "bathrooms", "property_type", "listing_type", "listing_url", "image_url"]
+    """Serialize a list of Properties to CSV, including all detail-page fields."""
+    fields = [
+        "listing_id", "title", "price", "price_pcm", "price_per_week", "address",
+        "bedrooms", "bathrooms", "property_type", "listing_type", "listing_url", "image_url",
+        # detail-page fields
+        "furnished_state", "furnished_label", "epc_rating", "available_date",
+        "features", "description", "size_sq_ft", "deposit", "council_tax_band",
+        "parking", "outdoor_space", "bills_included", "agent_name", "num_photos",
+        "has_floorplan", "is_shared_ownership", "is_retirement_home", "tenure",
+        "listing_condition", "property_type_detail",
+    ]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
     for p in properties:
-        writer.writerow(p.model_dump())
+        row = p.model_dump()
+        # Join list fields (features) into a pipe-separated string for CSV
+        if "features" in row and row["features"]:
+            row["features"] = "|".join(row["features"])
+        writer.writerow(row)
     return buf.getvalue()
 
 
@@ -488,6 +983,7 @@ async def get_agency_listings(
     max_pages: int = Query(3, ge=1, le=10, description="Maximum pages to scrape"),
     listing_type: str = Query("rent", description="rent or sale"),
     fmt: str = Query("json", description="json or csv"),
+    details: bool = Query(FETCH_DETAILS_DEFAULT, description="Fetch each listing's detail page for enriched data (default: true)"),
     record: dict = Depends(authenticate),
 ):
     # 1. Rate limit (per owner)
@@ -495,7 +991,7 @@ async def get_agency_listings(
     if not limiter.allow(record["owner"], limit):
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({limit}/min for owner '{record['owner']}')")
 
-    cache_key = (branch_id, listing_type, max_pages)
+    cache_key = (branch_id, listing_type, max_pages, details)
     cached = cache.get(cache_key)
     if cached is not None:
         if fmt == "csv":
@@ -506,7 +1002,7 @@ async def get_agency_listings(
     loop = asyncio.get_event_loop()
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor() as pool:
-        properties = await loop.run_in_executor(pool, scrape_zoopla_agency, branch_id, max_pages, listing_type)
+        properties = await loop.run_in_executor(pool, scrape_zoopla_agency, branch_id, max_pages, listing_type, details)
 
     # Never cache empty results: they are usually a transient bot-challenge/empty
     # page, and caching them would poison the cache for the whole TTL window.
