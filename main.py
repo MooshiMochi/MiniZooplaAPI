@@ -375,6 +375,20 @@ DEPOSIT_RE = re.compile(r"Deposit:\s*£?([\d,]+(?:[.,]\d{2})?)", re.I)
 COUNCIL_TAX_RE = re.compile(r"Council\s+Tax\s+Band:\s*([A-Ja-j]|Not\s+yet\s+known|Tbc|TBC|To\s+be\s+confirmed)", re.I)
 HOLDING_DEPOSIT_RE = re.compile(r"Holding\s+Deposit:\s*£?([\d,]+(?:[.,]\d{2})?)", re.I)
 
+# Listing transactional status (rendered as a DOM overlay/badge on the card
+# image, and on the detail page hero). Zoopla shows these only when a listing
+# is agreed/under offer; a live listing shows NO status text -> "Available".
+# Promotional labels ("Just added", "Property of the week", "Highlight",
+# "Reduced") are NOT transactional status and are deliberately ignored.
+LISTING_STATUS_PATTERNS = [
+    (re.compile(r"\blet\s*agreed\b", re.I), "Let agreed"),
+    (re.compile(r"\bsold\s*stc\b", re.I), "Sold STC"),
+    (re.compile(r"\bunder\s*offer\b", re.I), "Under offer"),
+    (re.compile(r"\bsold\b(?! house prices|\s*prices)", re.I), "Sold"),
+    (re.compile(r"\bto\s*rent\b", re.I), None),   # never treat "to rent" as status
+    (re.compile(r"\bfor\s*sale\b", re.I), None),  # never treat "for sale" as status
+]
+
 # Keywords for inferring boolean flags from features + description text
 PARKING_KEYWORDS = re.compile(r"\b(parking|car\s+parking|driveway|garage|off-street\s+parking|allocated\s+parking|secure\s+parking|on-street\s+parking|parking\s+space)\b", re.I)
 OUTDOOR_KEYWORDS = re.compile(r"\b(garden|patio|yard|outdoor\s+space|terrace|balcony|decking|communal\s+garden|green\s+space|rear\s+garden|front\s+garden|brick\s+work|courtyard)\b", re.I)
@@ -392,6 +406,7 @@ class Property(BaseModel):
     bathrooms: Optional[int] = None
     property_type: Optional[str] = None
     listing_type: Optional[str] = None
+    listing_status: Optional[str] = "Available"  # card overlay: "Let agreed" / "Sold STC" / "Under offer" / "Sold"; "Available" when none shown
     listing_url: str
     image_url: Optional[str] = None
 
@@ -448,6 +463,26 @@ def _to_int(text: Optional[str]) -> Optional[int]:
 def _extract_listing_id(url: str) -> Optional[str]:
     m = LISTING_ID_RE.search(url or "")
     return m.group(1) if m else None
+
+
+def _classify_listing_status(card_text: str) -> str:
+    """Return the transactional listing status from a card's full text.
+
+    Zoopla renders the status as a DOM overlay/badge on the card image only
+    when a listing is agreed/under offer. If none of the known status phrases
+    appear, the listing is live -> "Available".
+
+    `card_text` must be the WHOLE card's text (scoped to the card row), so we
+    don't accidentally match the site footer's "Sold house prices" wording.
+    Promotional labels are ignored on purpose.
+    """
+    text = card_text or ""
+    for pattern, label in LISTING_STATUS_PATTERNS:
+        if pattern.search(text):
+            if label is None:
+                continue
+            return label
+    return "Available"
 
 
 # ============================================================================
@@ -639,6 +674,10 @@ def _parse_detail_page(html_content: str, listing_url: str) -> dict:
     # ------------------------------------------------------------------
     full_text = (page_selector.css("body", auto_save=False) or [None])[0]
     body_text = (full_text.text if full_text else "").strip()
+
+    # Transactional status from the detail-page hero (mirrors the card overlay).
+    # A live listing shows no status phrase -> "Available".
+    result["listing_status"] = _classify_listing_status(body_text)
 
     # EPC rating: look for "EPC Rating: C" pattern
     epc_m = EPC_RE.search(body_text)
@@ -1013,11 +1052,16 @@ def parse_listing(row: Selector, listing_type: str, cards: dict = None) -> Optio
             if src and src.startswith("http"):
                 image_url = src
 
+        # Transactional status from the card's overlay badge. Build the whole
+        # card text once (scoped to this row) and classify it.
+        card_text = (row.text or "")
+        listing_status = _classify_listing_status(card_text)
+
         return Property(
             listing_id=listing_id, title=title or "Unknown", price=price_text or "POA",
             price_pcm=price_pcm, price_per_week=price_per_week, address=address,
             bedrooms=bedrooms, bathrooms=bathrooms, property_type=None,
-            listing_type=listing_type, listing_url=listing_url, image_url=image_url,
+            listing_type=listing_type, listing_status=listing_status, listing_url=listing_url, image_url=image_url,
         )
     except Exception as e:
         logger.debug("Parse error: %s", e)
@@ -1028,7 +1072,7 @@ def properties_to_csv(properties: List[Property]) -> str:
     """Serialize a list of Properties to CSV, including all detail-page fields."""
     fields = [
         "listing_id", "title", "price", "price_pcm", "price_per_week", "address",
-        "bedrooms", "bathrooms", "property_type", "listing_type", "listing_url", "image_url",
+        "bedrooms", "bathrooms", "property_type", "listing_type", "listing_status", "listing_url", "image_url",
         # detail-page fields
         "furnished_state", "furnished_label", "epc_rating", "available_date",
         "features", "description", "size_sq_ft", "deposit", "council_tax_band",
