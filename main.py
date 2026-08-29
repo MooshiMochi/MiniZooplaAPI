@@ -392,7 +392,12 @@ LISTING_STATUS_PATTERNS = [
 # Keywords for inferring boolean flags from features + description text
 PARKING_KEYWORDS = re.compile(r"\b(parking|car\s+parking|driveway|garage|off-street\s+parking|allocated\s+parking|secure\s+parking|on-street\s+parking|parking\s+space)\b", re.I)
 OUTDOOR_KEYWORDS = re.compile(r"\b(garden|patio|yard|outdoor\s+space|terrace|balcony|decking|communal\s+garden|green\s+space|rear\s+garden|front\s+garden|brick\s+work|courtyard)\b", re.I)
-BILLS_KEYWORDS = re.compile(r"\b(bills?\s+inclusive|bills?\s+included|all\s+bills?\s+inclusive|utility\s+bills?\s+included|council\s+tax\s+included)\b", re.I)
+BILLS_KEYWORDS = re.compile(
+    r"(bills?\s+(?:all\s+)?(?:inclusive|included)|"
+    r"utility\s+bills?\s+included|"
+    r"(?:council\s+tax|gas|water|electricity|electric|utilities|heating)\b[^\.]{0,25}?\bincluded\b|"
+    r"\bincluded\b[^\.]{0,25}?(?:council\s+tax|gas|water|electricity|electric|utilities))",
+    re.I)
 
 
 class Property(BaseModel):
@@ -428,6 +433,7 @@ class Property(BaseModel):
     parking: bool = False                           # True if any feature/description mentions parking
     outdoor_space: bool = False                     # True if garden / patio / yard / driveway mentioned
     bills_included: bool = False                    # True if "bills inclusive" / "bills included" found
+    notes: Optional[str] = None                      # letting arrangements / bills-included summary from the detail page
     agent_name: Optional[str] = None                # branch/brand name from hidden JSON
     num_photos: Optional[int] = None                # from hidden JSON (num_images)
     has_floorplan: bool = False                     # from hidden JSON (has_floorplan)
@@ -500,6 +506,47 @@ def _card_text(row: Selector) -> str:
         if t:
             parts.append(t)
     return " ".join(parts)
+
+
+def _extract_description_html(html_content: str) -> Optional[str]:
+    """Extract the full marketing description from raw HTML.
+
+    scrapling's adaptive Selector only yields the FIRST paragraph of Zoopla's
+    description container (the rest of the text lives in sibling <p>/<span>
+    nodes the parser drops). The full description is wrapped in
+    `<div class="DetailedDescription_detailedDescription__...">` which contains
+    the `<p id="detailed-desc">` lead-in plus the remaining paragraphs (incl. the
+    "X included" clause). We pull that whole wrapper, strip tags, and join.
+    Returns None if not found.
+    """
+    # Prefer the wrapper div that holds the entire description.
+    m = re.search(r'<div[^>]*class="[^"]*detailedDescription__[^"]*"[^>]*>', html_content)
+    if not m:
+        # Fallback: the lead-in <p id="detailed-desc"> itself (single paragraph).
+        m = re.search(r'<p[^>]*id="detailed-desc"[^>]*>', html_content)
+    if not m:
+        return None
+    start = m.end()
+    # balance closing tags of the SAME element type we opened with
+    open_tag, close_tag = ("<div", "</div>") if m.group(0).startswith("<div") else ("<p", "</p>")
+    depth = 1
+    i = start
+    while i < len(html_content) and depth > 0:
+        nxt_open = html_content.find(open_tag, i)
+        nxt_close = html_content.find(close_tag, i)
+        if nxt_close < 0:
+            break
+        if nxt_open >= 0 and nxt_open < nxt_close:
+            depth += 1
+            i = nxt_open + len(open_tag)
+        else:
+            depth -= 1
+            i = nxt_close + len(close_tag)
+    block = html_content[start:i]
+    text = re.sub(r"<[^>]+>", " ", block)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^About this property\s*", "", text, flags=re.I)
+    return text or None
 
 
 # ============================================================================
@@ -605,9 +652,26 @@ def _extract_features_and_description(page_selector: Selector) -> tuple:
                     if "about this property" not in txt.lower():
                         features.append(txt)
 
-    # Strategy 2: if no features found in about section, look for any list on the page
-    # that's in the property description area
-    if not features:
+    # Strategy 2: if no features found in about section, look for the real
+    # marketing description. Zoopla renders it in
+    #   <div class="DetailedDescription_detailedDescriptionText__..." id="detailed-desc">
+    # This is the canonical description — prefer it over any generic <p> so we
+    # don't fall through to the legal footnotes ("Property descriptions ... are
+    # marketing materials provided by ..."), which otherwise match the heuristic.
+    if not description:
+        desc_node = page_selector.css(
+            '[class*="detailedDescriptionText"], [id="detailed-desc"], '
+            '[class*="DetailedDescription"]',
+            auto_save=False,
+        )
+        if desc_node:
+            # node.text only returns the first child segment; walk ALL descendant
+            # leaf text so the full description (incl. the "X included" clause
+            # that lives in a later sibling) is captured.
+            parts = [ (leaf.text or "").strip() for leaf in desc_node[0].css("*", auto_save=False) ]
+            description = " ".join(p for p in parts if p).strip() or (desc_node[0].text or "").strip()
+
+    if not description:
         full_desc_blocks = page_selector.css(
             '[class*="description"], [class*="propertyDesc"], '
             '[data-testid*="description"], article p',
@@ -615,13 +679,8 @@ def _extract_features_and_description(page_selector: Selector) -> tuple:
         )
         for block in full_desc_blocks:
             txt = (block.text or "").strip()
-            if txt and len(txt) > 100 and len(txt) < 5000:
+            if txt and len(txt) > 100 and len(txt) < 5000 and "does not warrant" not in txt:
                 description = txt
-                # Try splitting on bullet markers commonly used in Zoopla descriptions
-                for bullet in re.split(r"\n+|•|\*|●|\u2022", txt):
-                    b = bullet.strip()
-                    if b and len(b) < 200 and len(features) < 30:
-                        features.append(b)
                 break
 
     # If we still have no description, grab the largest text block from the page
@@ -638,6 +697,17 @@ def _extract_features_and_description(page_selector: Selector) -> tuple:
                     best = txt
                     best_len = len(txt)
         description = best
+
+    # Recover bullet features embedded in the description (Zoopla writes
+    # "Key Details: * Fully furnished studio flat * Separate kitchen ..." as
+    # asterisk-separated items). Split on bullet markers and keep short items.
+    if description and not features:
+        for bullet in re.split(r"[*\n•·\-\u2022]+", description):
+            b = bullet.strip()
+            if b and 2 < len(b) < 120 and len(features) < 40:
+                # Skip the prose lead-in (e.g. "RS Estate Agents are pleased to present...")
+                if re.search(r"bedroom|kitchen|bathroom|lounge|reception|floor|garden|parking|furnished|studio|flat|house|room|included|heating|double glazing|available", b, re.I):
+                    features.append(b)
 
     # Deduplicate features while preserving order
     seen_feat = set()
@@ -711,13 +781,29 @@ def _parse_detail_page(html_content: str, listing_url: str) -> dict:
             # Normalise to lower-case canonical form, but keep the display label
             break
 
-    # Available date: search the full text for "Available from ..." patterns
-    avail_m = AVAILABLE_RE.search(body_text)
-    if avail_m:
-        result["available_date"] = avail_m.group(0).strip()
+    # Available date: Zoopla renders it as a pill chip inside
+    #   <ul class="Tags_tagsList__..."><li><div class="ikxlt80">Available from 31 August 2026</div></li></ul>
+    # Prefer that chip (exact), falling back to a body-text regex for the
+    # "Available from <date>" / "Available now" / "Available immediately" forms.
+    avail_chip = page_selector.css('[class*="Tags_tagsList"] div[class*="ikxlt80"]', auto_save=False)
+    available_date = None
+    for chip in avail_chip:
+        t = (chip.text or "").strip()
+        if t.lower().startswith("available"):
+            available_date = t
+            break
+    if not available_date:
+        avail_m = AVAILABLE_RE.search(body_text)
+        if avail_m:
+            available_date = avail_m.group(0).strip()
+    if available_date:
+        result["available_date"] = available_date
 
-    # Features + description
-    features, description = _extract_features_and_description(page_selector)
+    # Features + description. Pull the description from raw HTML first (the
+    # adaptive Selector truncates it to one paragraph); fall back to the helper.
+    html_desc = _extract_description_html(html_content)
+    features, sel_desc = _extract_features_and_description(page_selector)
+    description = html_desc or sel_desc
     result["features"] = features
     result["description"] = description
 
@@ -730,8 +816,30 @@ def _parse_detail_page(html_content: str, listing_url: str) -> dict:
     result["parking"] = _extract_bool_flag(combined_text, PARKING_KEYWORDS)
     # Outdoor space
     result["outdoor_space"] = _extract_bool_flag(combined_text, OUTDOOR_KEYWORDS)
-    # Bills included
-    result["bills_included"] = _extract_bool_flag(combined_text, BILLS_KEYWORDS)
+
+    # Notes / bills: Zoopla's tag pills (e.g. "Bills included") and the
+    # "Letting arrangements" section carry utility/bills info. Capture any
+    # "X included" / "bills" phrasing from the chips + letting section into
+    # `notes`, and flag bills_included from chips + letting + description.
+    chip_texts = [ (c.text or "").strip() for c in page_selector.css('[class*="Tags_tagsList"] *', auto_save=False) ]
+    letting = page_selector.css('[class*="NtsInfo"], [class*="ntsInfo"], [class*="Letting"]', auto_save=False)
+    letting_text = " ".join((n.text or "") for n in letting)
+    notes_parts = []
+    for t in chip_texts + [letting_text]:
+        if re.search(r"bills?\s+incl|incl.*bills|utilities|council tax.*incl|gas.*incl|water.*incl|electric|included", t, re.I):
+            notes_parts.append(t.strip())
+    # Also capture utility-included phrasing from the description (e.g.
+    # "Council tax, gas and water are included") so it surfaces in notes.
+    # Split the description into sentences/clauses and keep those mentioning
+    # a utility together with "included".
+    for clause in re.split(r"[.\n;]", description or ""):
+        c = clause.strip()
+        if c and re.search(r"included", c, re.I) and re.search(r"council tax|gas|water|electric|utilit|bills?", c, re.I) and len(c) < 200:
+            notes_parts.append(c)
+    if notes_parts:
+        result["notes"] = " | ".join(dict.fromkeys(p for p in notes_parts if p))
+    bills_text = " ".join(chip_texts) + " " + letting_text + " " + combined_text
+    result["bills_included"] = _extract_bool_flag(bills_text, BILLS_KEYWORDS)
 
     # ------------------------------------------------------------------
     # 4. Deposit and council tax from "More information" section
@@ -1095,7 +1203,7 @@ def properties_to_csv(properties: List[Property]) -> str:
         # detail-page fields
         "furnished_state", "furnished_label", "epc_rating", "available_date",
         "features", "description", "size_sq_ft", "deposit", "council_tax_band",
-        "parking", "outdoor_space", "bills_included", "agent_name", "num_photos",
+        "parking", "outdoor_space", "bills_included", "notes", "agent_name", "num_photos",
         "has_floorplan", "is_shared_ownership", "is_retirement_home", "tenure",
         "listing_condition", "property_type_detail",
     ]
